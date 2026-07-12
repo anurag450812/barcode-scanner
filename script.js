@@ -42,15 +42,11 @@ function playSiren() {
 }
 
 function vibrate() {
-    if ('vibrate' in navigator) {
-        navigator.vibrate(200);
-    }
+    if ('vibrate' in navigator) navigator.vibrate(200);
 }
 
 function vibrateLong() {
-    if ('vibrate' in navigator) {
-        navigator.vibrate([200, 100, 200, 100, 200]);
-    }
+    if ('vibrate' in navigator) navigator.vibrate([200, 100, 200, 100, 200]);
 }
 
 async function copyToClipboard(text) {
@@ -117,21 +113,42 @@ function buildAWBMap(data) {
     });
 }
 
+function isMobile() {
+    return /Android|iPhone|iPad|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)
+        || (window.innerWidth <= 768);
+}
+
 function updateAWBStatus() {
     const statusEl = document.getElementById('awbStatus');
     const uploadEl = document.getElementById('uploadArea');
-    const shareEl = document.getElementById('shareSection');
+    const qrEl = document.getElementById('qrSection');
+    const mobileEl = document.getElementById('mobileConnectSection');
     const countEl = document.getElementById('awbCount');
 
-    if (awbData.length > 0) {
+    const hasData = awbData.length > 0;
+
+    if (hasData) {
         countEl.textContent = awbData.length;
         statusEl.style.display = 'flex';
-        shareEl.style.display = 'flex';
         uploadEl.style.display = 'none';
+        if (isMobile()) {
+            qrEl.style.display = 'none';
+            mobileEl.style.display = 'none';
+        } else {
+            qrEl.style.display = 'flex';
+            mobileEl.style.display = 'none';
+            generateQRCode();
+        }
     } else {
         statusEl.style.display = 'none';
-        shareEl.style.display = 'none';
-        uploadEl.style.display = 'flex';
+        qrEl.style.display = 'none';
+        if (isMobile()) {
+            uploadEl.style.display = 'none';
+            mobileEl.style.display = 'flex';
+        } else {
+            uploadEl.style.display = 'flex';
+            mobileEl.style.display = 'none';
+        }
     }
 }
 
@@ -171,28 +188,116 @@ function parseExcel(file) {
     });
 }
 
-// URL-based sync: compress data into URL hash
-async function generateShareLink() {
+// QR Code generation
+let qrInstance = null;
+
+function generateQRCode() {
     const compressed = LZString.compressToEncodedURIComponent(JSON.stringify(awbData));
-    const baseUrl = window.location.origin + window.location.pathname;
-    return baseUrl + '#data=' + compressed;
-}
+    const qrContainer = document.getElementById('qrCode');
+    qrContainer.innerHTML = '';
 
-function getDataFromURL() {
-    const hash = window.location.hash;
-    if (hash && hash.startsWith('#data=')) {
-        try {
-            const compressed = hash.substring(6);
-            const json = LZString.decompressFromEncodedURIComponent(compressed);
-            return JSON.parse(json);
-        } catch (e) {
-            console.error('Failed to parse data from URL:', e);
-            return null;
-        }
+    // QR codes max ~4296 alphanumeric chars; use larger error correction
+    // For safety, warn if data is large
+    if (compressed.length > 3000) {
+        qrContainer.innerHTML = '<p class="qr-warning">Data too large for single QR code. Showing first portion.</p>';
     }
-    return null;
+
+    qrInstance = new QRCode(qrContainer, {
+        text: compressed.substring(0, 3000),
+        width: 200,
+        height: 200,
+        colorDark: '#000000',
+        colorLight: '#ffffff',
+        correctLevel: QRCode.CorrectLevel.M
+    });
 }
 
+// QR Code scanning (for mobile)
+let qrScanStream = null;
+let qrScanDetector = null;
+
+async function startQRScan() {
+    try {
+        const detector = new BarcodeDetector({ formats: ['qr_code'] });
+        const mediaStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment' }
+        });
+
+        const tempVideo = document.createElement('video');
+        tempVideo.srcObject = mediaStream;
+        tempVideo.autoplay = true;
+        tempVideo.playsinline = true;
+        tempVideo.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:9999;object-fit:cover;background:#000;';
+
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:10000;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;';
+
+        const instruction = document.createElement('div');
+        instruction.textContent = 'Point camera at QR code on PC screen';
+        instruction.style.cssText = 'color:white;font-size:18px;font-weight:600;text-shadow:0 2px 8px rgba(0,0,0,0.8);padding:16px 24px;background:rgba(0,0,0,0.6);border-radius:12px;margin-bottom:20px;pointer-events:auto;text-align:center;';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.style.cssText = 'color:white;font-size:16px;font-weight:600;padding:12px 32px;background:rgba(239,83,80,0.9);border:none;border-radius:10px;cursor:pointer;pointer-events:auto;margin-top:10px;';
+        cancelBtn.onclick = () => stopQRScan(mediaStream, tempVideo, overlay);
+
+        overlay.appendChild(instruction);
+        overlay.appendChild(cancelBtn);
+        document.body.appendChild(tempVideo);
+        document.body.appendChild(overlay);
+
+        await tempVideo.play();
+
+        const tempCanvas = document.createElement('canvas');
+        const tempCtx = tempCanvas.getContext('2d');
+
+        async function scanLoop() {
+            if (!tempVideo.videoWidth) {
+                requestAnimationFrame(scanLoop);
+                return;
+            }
+            tempCanvas.width = tempVideo.videoWidth;
+            tempCanvas.height = tempVideo.videoHeight;
+            tempCtx.drawImage(tempVideo, 0, 0);
+
+            try {
+                const barcodes = await detector.detect(tempCanvas);
+                if (barcodes.length > 0) {
+                    const qrData = barcodes[0].rawValue;
+                    if (qrData && qrData.length > 10) {
+                        try {
+                            const json = JSON.parse(LZString.decompressFromEncodedURIComponent(qrData));
+                            if (Array.isArray(json) && json.length > 0) {
+                                stopQRScan(mediaStream, tempVideo, overlay);
+                                await saveAWBToDB(json);
+                                buildAWBMap(json);
+                                updateAWBStatus();
+                                playBeep();
+                                vibrate();
+                                return;
+                            }
+                        } catch (e) {
+                            // Not valid QR data, keep scanning
+                        }
+                    }
+                }
+            } catch (e) { /* ignore detection errors */ }
+
+            requestAnimationFrame(scanLoop);
+        }
+        scanLoop();
+    } catch (err) {
+        alert('Unable to access camera for QR scanning: ' + err.message);
+    }
+}
+
+function stopQRScan(mediaStream, videoEl, overlayEl) {
+    mediaStream.getTracks().forEach(t => t.stop());
+    videoEl.remove();
+    overlayEl.remove();
+}
+
+// Barcode detection
 async function initBarcodeDetector() {
     if (!('BarcodeDetector' in window)) {
         alert('Barcode Detection API is not supported in this browser. Please use Chrome on Android or a compatible browser.');
@@ -341,21 +446,12 @@ window.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('startBtn').addEventListener('click', startScanning);
     document.getElementById('stopBtn').addEventListener('click', stopScanning);
 
-    // Check URL for shared data first
-    const urlData = getDataFromURL();
-    if (urlData && urlData.length > 0) {
-        buildAWBMap(urlData);
-        await saveAWBToDB(urlData);
-        updateAWBStatus();
-        window.location.hash = '';
-    } else {
-        // Load from IndexedDB
-        const saved = await loadAWBFromDB();
-        if (saved && saved.length > 0) {
-            buildAWBMap(saved);
-            updateAWBStatus();
-        }
+    // Load saved data
+    const saved = await loadAWBFromDB();
+    if (saved && saved.length > 0) {
+        buildAWBMap(saved);
     }
+    updateAWBStatus();
 
     // File upload handler
     document.getElementById('uploadBtn').addEventListener('click', () => {
@@ -384,22 +480,9 @@ window.addEventListener('DOMContentLoaded', async () => {
         document.getElementById('matchResult').style.display = 'none';
     });
 
-    // Generate share link
-    document.getElementById('shareBtn').addEventListener('click', async () => {
-        const link = await generateShareLink();
-        document.getElementById('shareLink').value = link;
-        document.getElementById('shareLinkBox').style.display = 'flex';
-    });
-
-    // Copy link
-    document.getElementById('copyLinkBtn').addEventListener('click', () => {
-        const input = document.getElementById('shareLink');
-        input.select();
-        copyToClipboard(input.value);
-        document.getElementById('copyLinkBtn').textContent = 'Copied!';
-        setTimeout(() => {
-            document.getElementById('copyLinkBtn').textContent = 'Copy';
-        }, 2000);
+    // QR scan button (mobile)
+    document.getElementById('scanQRBtn').addEventListener('click', () => {
+        startQRScan();
     });
 
     // Upload area drag & drop
