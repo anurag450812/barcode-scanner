@@ -106,84 +106,6 @@ h1 {
     box-shadow: 0 3px 10px rgba(239, 83, 80, 0.4) !important;
 }
 
-/* QR Section */
-.qr-section {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-    margin-top: 15px;
-    padding: 20px;
-    background: #f0f3ff;
-    border-radius: 12px;
-    border: 2px solid #667eea;
-}
-
-.qr-label {
-    font-size: 14px;
-    font-weight: 600;
-    color: #333;
-    text-align: center;
-}
-
-.qr-code {
-    display: flex;
-    justify-content: center;
-    padding: 10px;
-    background: white;
-    border-radius: 10px;
-}
-
-.qr-code img {
-    border-radius: 6px;
-}
-
-.qr-hint {
-    font-size: 12px;
-    color: #888;
-    text-align: center;
-}
-
-.qr-warning {
-    color: #e65100;
-    font-size: 12px;
-    text-align: center;
-    margin-bottom: 8px;
-}
-
-/* Mobile Connect Section */
-.mobile-connect {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-    padding: 25px 20px;
-    border: 2px dashed #667eea;
-    border-radius: 12px;
-    background: #f0f3ff;
-    text-align: center;
-}
-
-.mobile-connect p {
-    color: #333;
-    font-size: 14px;
-    font-weight: 600;
-}
-
-.scan-qr-btn {
-    background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%) !important;
-    color: white !important;
-    padding: 14px 28px !important;
-    font-size: 16px !important;
-    text-transform: none !important;
-    letter-spacing: 0 !important;
-}
-
-.scan-qr-btn:hover {
-    transform: translateY(-2px) !important;
-    box-shadow: 0 5px 15px rgba(79, 172, 254, 0.4) !important;
-}
-
 /* Scanner */
 .scanner-container {
     position: relative;
@@ -355,13 +277,5 @@ button:disabled {
 
     .match-details {
         padding: 12px 15px;
-    }
-
-    .qr-section {
-        padding: 15px;
-    }
-
-    .mobile-connect {
-        padding: 20px 15px;
     }
 }

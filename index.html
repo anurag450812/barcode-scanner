@@ -6,8 +6,6 @@
     <title>Barcode Scanner</title>
     <link rel="stylesheet" href="style.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -22,15 +20,6 @@
             <div id="awbStatus" class="awb-status" style="display:none;">
                 <span id="awbCount">0</span> AWB numbers loaded
                 <button id="clearDataBtn" class="clear-btn">Clear Data</button>
-            </div>
-            <div id="qrSection" class="qr-section" style="display:none;">
-                <p class="qr-label">Scan this QR on your mobile to load data</p>
-                <div id="qrCode" class="qr-code"></div>
-                <p class="qr-hint">Open the scanner on mobile &rarr; tap "Load from QR"</p>
-            </div>
-            <div id="mobileConnectSection" class="mobile-connect" style="display:none;">
-                <p>Or load AWB data from PC:</p>
-                <button id="scanQRBtn" class="scan-qr-btn">Scan QR from PC</button>
             </div>
         </div>
 
