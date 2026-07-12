@@ -226,17 +226,6 @@ function showMatch(row) {
     vibrateLong();
 }
 
-function showNoMatch(barcodeValue) {
-    const matchEl = document.getElementById('matchResult');
-    const headerEl = document.getElementById('matchHeader');
-    const detailsEl = document.getElementById('matchDetails');
-
-    headerEl.textContent = 'AWB NOT FOUND';
-    headerEl.className = 'match-header match-not-found';
-    detailsEl.innerHTML = `<div class="match-row"><span class="match-value">${barcodeValue} is not in the uploaded list</span></div>`;
-    matchEl.style.display = 'block';
-}
-
 async function scanBarcode() {
     if (!scanning) return;
     context.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -257,16 +246,12 @@ async function scanBarcode() {
                     const found = awbMap[barcodeValue.trim()];
                     if (found) {
                         showMatch(found);
-                    } else {
-                        showNoMatch(barcodeValue);
                     }
-                } else {
-                    document.getElementById('matchResult').style.display = 'none';
                 }
 
                 setTimeout(() => {
                     if (scanning) requestAnimationFrame(scanBarcode);
-                }, 1500);
+                }, 500);
                 return;
             }
         }

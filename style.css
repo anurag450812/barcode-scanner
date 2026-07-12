@@ -206,12 +206,6 @@ button:disabled {
     animation: pulseFound 0.6s ease-in-out 3;
 }
 
-.match-not-found {
-    background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);
-    color: white;
-    animation: shake 0.4s ease-in-out;
-}
-
 .match-details {
     padding: 16px 20px;
     background: #f8f9fa;
@@ -240,12 +234,6 @@ button:disabled {
 @keyframes pulseFound {
     0%, 100% { transform: scale(1); }
     50% { transform: scale(1.03); }
-}
-
-@keyframes shake {
-    0%, 100% { transform: translateX(0); }
-    25% { transform: translateX(-5px); }
-    75% { transform: translateX(5px); }
 }
 
 @media (max-width: 480px) {
