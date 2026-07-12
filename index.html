@@ -5,10 +5,32 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Barcode Scanner</title>
     <link rel="stylesheet" href="style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 </head>
 <body>
     <div class="container">
         <h1>Barcode Scanner</h1>
+
+        <div id="awbSection" class="awb-section">
+            <div id="uploadArea" class="upload-area">
+                <p>Upload Excel file with AWB Numbers</p>
+                <input type="file" id="fileInput" accept=".xlsx,.xls" hidden>
+                <button id="uploadBtn" class="upload-btn">Choose Excel File</button>
+            </div>
+            <div id="awbStatus" class="awb-status" style="display:none;">
+                <span id="awbCount">0</span> AWB numbers loaded
+                <button id="clearDataBtn" class="clear-btn">Clear Data</button>
+            </div>
+            <div id="shareSection" class="share-section" style="display:none;">
+                <button id="shareBtn" class="share-btn">Generate Mobile Link</button>
+                <div id="shareLinkBox" class="share-link-box" style="display:none;">
+                    <input type="text" id="shareLink" readonly>
+                    <button id="copyLinkBtn" class="copy-link-btn">Copy</button>
+                </div>
+            </div>
+        </div>
+
         <div class="scanner-container">
             <video id="video" autoplay playsinline></video>
             <canvas id="canvas"></canvas>
@@ -20,8 +42,12 @@
         <div id="result">
             <p id="resultText">Waiting for scan...</p>
         </div>
+        <div id="matchResult" class="match-result" style="display:none;">
+            <div id="matchHeader" class="match-header">AWB FOUND</div>
+            <div id="matchDetails" class="match-details"></div>
+        </div>
     </div>
-    
+
     <script src="script.js"></script>
 </body>
 </html>
