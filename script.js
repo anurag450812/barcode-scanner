@@ -8,6 +8,10 @@ let stream;
 let awbData = [];
 let awbMap = {};
 
+let lastScannedValue = '';
+let lastScanTime = 0;
+let detectorReinitTimer = null;
+
 const audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
 function playBeep() {
@@ -234,9 +238,16 @@ async function scanBarcode() {
         if (barcodes.length > 0) {
             const barcode = barcodes[0];
             const barcodeValue = barcode.rawValue;
-            const copied = await copyToClipboard(barcodeValue);
+            const now = Date.now();
 
-            if (copied) {
+            // Debounce: skip if same barcode scanned within 2 seconds
+            if (barcodeValue !== lastScannedValue || now - lastScanTime > 2000) {
+                lastScannedValue = barcodeValue;
+                lastScanTime = now;
+
+                // Fire-and-forget clipboard copy
+                copyToClipboard(barcodeValue);
+
                 playBeep();
                 vibrate();
                 document.getElementById('resultText').textContent =
@@ -248,17 +259,40 @@ async function scanBarcode() {
                         showMatch(found);
                     }
                 }
-
-                setTimeout(() => {
-                    if (scanning) requestAnimationFrame(scanBarcode);
-                }, 500);
-                return;
             }
         }
     } catch (err) {
         console.error('Error detecting barcode:', err);
+        reinitDetector();
     }
     requestAnimationFrame(scanBarcode);
+}
+
+function reinitDetector() {
+    if (!('BarcodeDetector' in window)) return;
+    try {
+        barcodeDetector = new BarcodeDetector({
+            formats: [
+                'aztec', 'code_128', 'code_39', 'code_93', 'codabar',
+                'data_matrix', 'ean_13', 'ean_8', 'itf', 'pdf417',
+                'qr_code', 'upc_a', 'upc_e'
+            ]
+        });
+    } catch (e) { /* ignore */ }
+}
+
+function startDetectorRefresh() {
+    stopDetectorRefresh();
+    detectorReinitTimer = setInterval(() => {
+        if (scanning) reinitDetector();
+    }, 30000);
+}
+
+function stopDetectorRefresh() {
+    if (detectorReinitTimer) {
+        clearInterval(detectorReinitTimer);
+        detectorReinitTimer = null;
+    }
 }
 
 async function startScanning() {
@@ -269,9 +303,12 @@ async function startScanning() {
     if (!cameraReady) return;
 
     scanning = true;
+    lastScannedValue = '';
+    lastScanTime = 0;
     document.getElementById('startBtn').disabled = true;
     document.getElementById('stopBtn').disabled = false;
     document.getElementById('resultText').textContent = 'Scanning...';
+    startDetectorRefresh();
 
     video.onloadedmetadata = () => {
         canvas.width = video.videoWidth;
@@ -283,6 +320,7 @@ async function startScanning() {
 function stopScanning() {
     scanning = false;
     stopCamera();
+    stopDetectorRefresh();
     document.getElementById('startBtn').disabled = false;
     document.getElementById('stopBtn').disabled = true;
     document.getElementById('resultText').textContent = 'Scanner stopped';
