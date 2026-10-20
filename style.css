@@ -126,6 +126,61 @@ h1 {
     display: none;
 }
 
+/* Zoom controls */
+.zoom-controls {
+    display: none;
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+}
+
+.zoom-controls.active {
+    display: flex;
+}
+
+.zoom-btn {
+    flex: none !important;
+    width: 40px;
+    height: 40px;
+    padding: 0 !important;
+    font-size: 22px !important;
+    line-height: 1;
+    border-radius: 50% !important;
+    background: rgba(255, 255, 255, 0.92);
+    color: #333;
+    text-transform: none !important;
+    letter-spacing: 0 !important;
+}
+
+.zoom-btn:hover:not(:disabled) {
+    background: #fff;
+    transform: none;
+    box-shadow: none;
+}
+
+#zoomSlider {
+    flex: 1;
+    min-width: 0;
+    accent-color: #667eea;
+    cursor: pointer;
+}
+
+#zoomValue {
+    flex: none;
+    min-width: 44px;
+    text-align: right;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 700;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
 .controls {
     display: flex;
     gap: 10px;

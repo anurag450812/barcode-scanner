@@ -5,6 +5,14 @@ let scanning = false;
 let barcodeDetector;
 let stream;
 
+let videoTrack = null;
+let zoomLevel = 1;
+let zoomMin = 1;
+let zoomMax = 6;
+let zoomStep = 0;
+let hardwareZoom = false;
+let zoomApplyChain = Promise.resolve();
+
 let awbData = [];
 let awbMap = {};
 
@@ -193,6 +201,8 @@ async function startCamera() {
         stream = await navigator.mediaDevices.getUserMedia({
             video: { facingMode: 'environment' }
         });
+        videoTrack = stream.getVideoTracks()[0];
+        initZoom();
         video.srcObject = stream;
         return true;
     } catch (err) {
@@ -206,7 +216,98 @@ function stopCamera() {
     if (stream) {
         stream.getTracks().forEach(track => track.stop());
         stream = null;
+        videoTrack = null;
     }
+}
+
+// Zoom support: uses native camera zoom when available, digital zoom otherwise
+function initZoom() {
+    zoomMin = 1;
+    zoomMax = 6;
+    zoomStep = 0;
+    hardwareZoom = false;
+    zoomLevel = 1;
+    try {
+        const caps = (videoTrack && videoTrack.getCapabilities) ? videoTrack.getCapabilities() : {};
+        if (caps && typeof caps.zoom === 'object' && caps.zoom && typeof caps.zoom.max === 'number') {
+            hardwareZoom = true;
+            zoomMin = typeof caps.zoom.min === 'number' ? caps.zoom.min : 1;
+            zoomMax = typeof caps.zoom.max === 'number' ? caps.zoom.max : zoomMin;
+            if (typeof caps.zoom.step === 'number' && caps.zoom.step > 0) {
+                zoomStep = caps.zoom.step;
+            }
+            const current = (videoTrack.getSettings) ? videoTrack.getSettings().zoom : null;
+            if (typeof current === 'number' && current >= zoomMin && current <= zoomMax) {
+                zoomLevel = snapZoom(current);
+            } else {
+                zoomLevel = zoomMin;
+            }
+        }
+    } catch (err) {
+        hardwareZoom = false;
+    }
+    video.style.transform = '';
+    applyZoom();
+    updateZoomUI();
+}
+
+function snapZoom(value) {
+    if (!zoomStep || zoomStep <= 0) return value;
+    const snapped = zoomMin + Math.round((value - zoomMin) / zoomStep) * zoomStep;
+    return Math.round(snapped * 1000) / 1000;
+}
+
+function setZoom(value) {
+    let clamped = Math.min(zoomMax, Math.max(zoomMin, value));
+    if (hardwareZoom) clamped = snapZoom(clamped);
+    if (clamped === zoomLevel) return;
+    zoomLevel = clamped;
+    applyZoom();
+    updateZoomUI();
+}
+
+function applyZoom() {
+    if (hardwareZoom && videoTrack) {
+        const target = zoomLevel;
+        zoomApplyChain = zoomApplyChain.then(() =>
+            videoTrack.applyConstraints({ advanced: [{ zoom: target }] })
+                .catch(() => {
+                    // Native zoom rejected on this device, fall back to digital zoom
+                    hardwareZoom = false;
+                    zoomStep = 0;
+                    zoomMin = 1;
+                    zoomMax = Math.min(zoomMax, 6);
+                    zoomLevel = Math.min(zoomLevel, zoomMax);
+                    video.style.transform = zoomLevel > 1 ? `scale(${zoomLevel})` : '';
+                    updateZoomUI();
+                })
+        );
+    } else {
+        video.style.transform = zoomLevel > 1 ? `scale(${zoomLevel})` : '';
+    }
+}
+
+function updateZoomUI() {
+    const slider = document.getElementById('zoomSlider');
+    if (!slider) return;
+    slider.min = zoomMin;
+    slider.max = zoomMax;
+    slider.step = (hardwareZoom && zoomStep > 0) ? zoomStep : 0.1;
+    slider.value = zoomLevel;
+    const decimals = (hardwareZoom && zoomStep > 0 && zoomStep < 0.1) ? 2 : 1;
+    document.getElementById('zoomValue').textContent = zoomLevel.toFixed(decimals) + 'x';
+    document.getElementById('zoomOutBtn').disabled = zoomLevel <= zoomMin + 0.001;
+    document.getElementById('zoomInBtn').disabled = zoomLevel >= zoomMax - 0.001;
+}
+
+function resetZoom() {
+    zoomLevel = 1;
+    zoomMin = 1;
+    zoomMax = 6;
+    zoomStep = 0;
+    hardwareZoom = false;
+    video.style.transform = '';
+    updateZoomUI();
 }
 
 function showMatch(row) {
@@ -230,9 +331,24 @@ function showMatch(row) {
     vibrateLong();
 }
 
+function drawVideoFrame() {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!hardwareZoom && zoomLevel > 1 && vw > 0 && vh > 0) {
+        // Digital zoom: send only the centered crop to the detector
+        const sw = vw / zoomLevel;
+        const sh = vh / zoomLevel;
+        const sx = (vw - sw) / 2;
+        const sy = (vh - sh) / 2;
+        context.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    } else {
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    }
+}
+
 async function scanBarcode() {
     if (!scanning) return;
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    drawVideoFrame();
     try {
         const barcodes = await barcodeDetector.detect(canvas);
         if (barcodes.length > 0) {
@@ -308,6 +424,7 @@ async function startScanning() {
     document.getElementById('startBtn').disabled = true;
     document.getElementById('stopBtn').disabled = false;
     document.getElementById('resultText').textContent = 'Scanning...';
+    document.getElementById('zoomControls').classList.add('active');
     startDetectorRefresh();
 
     video.onloadedmetadata = () => {
@@ -321,6 +438,8 @@ function stopScanning() {
     scanning = false;
     stopCamera();
     stopDetectorRefresh();
+    resetZoom();
+    document.getElementById('zoomControls').classList.remove('active');
     document.getElementById('startBtn').disabled = false;
     document.getElementById('stopBtn').disabled = true;
     document.getElementById('resultText').textContent = 'Scanner stopped';
@@ -334,6 +453,13 @@ window.addEventListener('DOMContentLoaded', async () => {
 
     document.getElementById('startBtn').addEventListener('click', startScanning);
     document.getElementById('stopBtn').addEventListener('click', stopScanning);
+
+    // Zoom controls
+    document.getElementById('zoomInBtn').addEventListener('click', () => setZoom(zoomLevel + 1));
+    document.getElementById('zoomOutBtn').addEventListener('click', () => setZoom(zoomLevel - 1));
+    document.getElementById('zoomSlider').addEventListener('input', (e) => {
+        setZoom(parseFloat(e.target.value));
+    });
 
     // Load saved data
     const saved = await loadAWBFromDB();
