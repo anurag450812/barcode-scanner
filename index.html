@@ -23,9 +23,14 @@
             </div>
         </div>
 
-        <div class="scanner-container">
-            <video id="video" autoplay playsinline></video>
+        <div class="scanner-container" id="scannerContainer">
+            <video id="video" autoplay muted playsinline></video>
             <canvas id="canvas"></canvas>
+            <div id="codeHighlights" class="code-highlights"></div>
+            <div id="regionLayer" class="region-layer">
+                <div id="regionBox" class="region-box"></div>
+                <div id="regionPrompt" class="region-prompt">Drag to select the barcode area</div>
+            </div>
             <div id="zoomControls" class="zoom-controls">
                 <button id="zoomOutBtn" class="zoom-btn" type="button">&minus;</button>
                 <input type="range" id="zoomSlider" min="1" max="6" step="0.1" value="1">
@@ -33,17 +38,24 @@
                 <span id="zoomValue">1.0x</span>
             </div>
         </div>
+        <div id="screenTools" class="screen-tools">
+            <p id="screenHint" class="screen-hint">Drag a rectangle on the preview. Only that area is scanned.</p>
+            <div class="screen-tool-row">
+                <button type="button" id="fullFrameBtn">Full frame</button>
+                <button type="button" id="reselectBtn">Reselect</button>
+            </div>
+        </div>
         <div class="controls">
-            <button id="startBtn">Start Scanner</button>
-            <button id="stopBtn" disabled>Stop Scanner</button>
+            <button id="startBtn" type="button">Start Scanner</button>
+            <button id="screenBtn" type="button">Scan Screen</button>
+            <button id="stopBtn" type="button" disabled>Stop Scanner</button>
         </div>
-        <div id="result">
+        <p class="share-note">The share picker has Entire screen, Window, and Chrome tab. If a window isn't listed, share Entire screen and drag over it.</p>
+        <div id="result" aria-live="polite">
             <p id="resultText">Waiting for scan...</p>
+            <ul id="codeList" class="code-list"></ul>
         </div>
-        <div id="matchResult" class="match-result" style="display:none;">
-            <div id="matchHeader" class="match-header">AWB FOUND</div>
-            <div id="matchDetails" class="match-details"></div>
-        </div>
+        <div id="matchList" class="match-list"></div>
     </div>
 
     <script src="script.js"></script>
