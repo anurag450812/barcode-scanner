@@ -23,6 +23,7 @@ https://returnsbarcodecopy.netlify.app
 - **Stop Scanner** releases the camera.
 - On Android Chrome this uses the built-in Barcode Detection API.
 - Several codes in one frame are all listed, the same as screen mode.
+- On a desktop, where the native detector is missing, the camera uses the same tilt and enlarge passes as screen mode. Hold the phone or the label steady for a tilted 1D code.
 
 ## Screen mode
 
@@ -35,6 +36,8 @@ https://returnsbarcodecopy.netlify.app
 5. **Stop Sharing** ends the capture. Ending it from the browser's own "Stop sharing" bar does the same thing and returns the page to idle.
 
 Every code in the region is read, listed with its format, and outlined on the preview. Each one is checked against the AWB sheet. Each matched AWB gets its own green card. A new code beeps once, and a new match plays the siren once. The same code is not announced again for 2 seconds, so a static screen does not keep beeping. The camera uses the same multi-code path.
+
+Tilted labels are read too. QR codes are detected at any angle. A 1D code has to cross a straight scan line, so the page turns the crop through 15, 30, 45 and 60 degrees in both directions, and also checks it sideways. The first pass each time the picture changes is the fast one (level and sideways codes, including QR). The slower tilt, contrast, and enlarge passes then run one per frame while the picture holds still, in a background decoder so the page stays responsive. A moving picture stays on the fast pass. Draw the box tightly around a small code; a loose box is enlarged, and a second enlarged pass runs when the first one finds nothing.
 
 ## Sounds
 

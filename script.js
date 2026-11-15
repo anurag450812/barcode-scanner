@@ -8,7 +8,6 @@ let nativeFormats = null;
 let decoderKind = null;
 let decoderPromise = null;
 let zxingScriptPromise = null;
-let thoroughTick = 0;
 let stream;
 
 let videoTrack = null;
@@ -27,8 +26,32 @@ let codeState = new Map();
 let frameMap = null;
 let cameraLoopRunning = false;
 let screenLoopToken = 0;
-let screenMissStreak = 0;
 let nativeFailureCount = 0;
+let decoderWorker = null;
+let workerPending = new Map();
+let workerJob = 0;
+let decodePlan = null;
+let lastScene = null;
+let boostCanvas = null;
+let boostContext = null;
+let boostScale = 1;
+let passCanvas = null;
+let passContext = null;
+let sceneCanvas = null;
+let sceneContext = null;
+let baseCanvas = null;
+let baseContext = null;
+let paintScale = 1;
+let lastCrop = null;
+const scanStats = {
+    decodes: 0,
+    decodeMs: 0,
+    skips: 0,
+    lastMs: 0,
+    lastPass: '',
+    sweepDone: true
+};
+window.scanStats = scanStats;
 
 let screenRegion = null;
 let awaitingRegion = false;
@@ -52,19 +75,24 @@ const NATIVE_FORMATS = [
 
 // Courier AWBs are usually Code 128. QR is included because labels often carry one.
 // Names are the zxing-wasm canonical format names.
+const ZXING_FORMATS = [
+    'Code128', 'Code39', 'Code93', 'Codabar', 'ITF',
+    'QRCode', 'EAN13', 'EAN8', 'UPCA', 'UPCE',
+    'PDF417', 'DataMatrix', 'Aztec'
+];
+// tryRotate covers 90, 180 and 270 only. A tilted 1D label needs the image
+// itself turned until a row crosses every bar. QR does not need these angles.
+const TILT_ANGLES = [15, -15, 30, -30, 45, -45, 60, -60];
 const ZXING_READER_OPTIONS = {
     tryHarder: true,
     tryRotate: true,
-    tryInvert: true,
+    tryInvert: false,
+    tryDenoise: false,
     // The crop is scaled before it gets here. Extra downscaling smears thin bars.
     tryDownscale: false,
     maxNumberOfSymbols: 32,
     textMode: 'Plain',
-    formats: [
-        'Code128', 'Code39', 'Code93', 'Codabar', 'ITF',
-        'QRCode', 'EAN13', 'EAN8', 'UPCA', 'UPCE',
-        'PDF417', 'DataMatrix', 'Aztec'
-    ]
+    formats: ZXING_FORMATS
 };
 
 function resumeAudio() {
@@ -293,9 +321,60 @@ function loadZXingScript() {
     return zxingScriptPromise;
 }
 
+function workerRequest(message, transfer) {
+    if (!decoderWorker) return Promise.reject(new Error('Decoder worker is not running'));
+    const id = ++workerJob;
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            workerPending.delete(id);
+            reject(new Error('Barcode decoder timed out'));
+        }, 12000);
+        workerPending.set(id, (payload) => {
+            clearTimeout(timer);
+            if (payload.ok) resolve(payload);
+            else reject(new Error(payload.error || 'Barcode decoder failed'));
+        });
+        decoderWorker.postMessage(Object.assign({ id: id }, message), transfer || []);
+    });
+}
+
+function startDecoderWorker() {
+    decoderWorker = new Worker(new URL('decoder-worker.js', window.location.href));
+    decoderWorker.onmessage = (event) => {
+        const data = event.data || {};
+        const pending = workerPending.get(data.id);
+        if (!pending) return;
+        workerPending.delete(data.id);
+        pending(data);
+    };
+    decoderWorker.onerror = (err) => {
+        const message = err && err.message ? err.message : 'Decoder worker failed';
+        workerPending.forEach(pending => pending({ ok: false, error: message }));
+        workerPending.clear();
+    };
+    return workerRequest({ type: 'warmup' });
+}
+
+function stopDecoderWorker() {
+    workerPending.forEach(pending => pending({ ok: false, error: 'Decoder worker stopped' }));
+    workerPending.clear();
+    if (decoderWorker) {
+        decoderWorker.terminate();
+        decoderWorker = null;
+    }
+}
+
 async function loadZXingDecoder() {
+    if (typeof Worker === 'function') {
+        try {
+            await startDecoderWorker();
+            return;
+        } catch (err) {
+            console.warn('Decoder worker failed, using the page thread', err);
+            stopDecoderWorker();
+        }
+    }
     await loadZXingScript();
-    // First call fetches and compiles the wasm module.
     await window.ZXingWASM.readBarcodes(new ImageData(8, 8), {
         formats: ['QRCode'],
         tryHarder: false,
@@ -336,15 +415,258 @@ function reinitDetector() {
     } catch (e) { /* ignore */ }
 }
 
-function zxingOptionsForFrame() {
-    thoroughTick += 1;
-    // Sideways and inverted codes are checked every few frames. The frames in
-    // between stay fast, which matters for a live screen share.
-    if (thoroughTick % 4 === 1) return ZXING_READER_OPTIONS;
+function resetDecodePlan() {
+    decodePlan = null;
+    lastScene = null;
+    boostScale = 1;
+    scanStats.decodes = 0;
+    scanStats.decodeMs = 0;
+    scanStats.skips = 0;
+    scanStats.lastMs = 0;
+    scanStats.lastPass = '';
+    scanStats.sweepDone = true;
+}
+
+function sceneChanged() {
+    if (!sceneCanvas) {
+        sceneCanvas = document.createElement('canvas');
+        sceneCanvas.width = 32;
+        sceneCanvas.height = 18;
+        sceneContext = sceneCanvas.getContext('2d', { willReadFrequently: true });
+    }
+    sceneContext.drawImage(canvas, 0, 0, 32, 18);
+    const data = sceneContext.getImageData(0, 0, 32, 18).data;
+    const stamp = canvas.width + 'x' + canvas.height;
+    if (!lastScene || lastScene.stamp !== stamp || lastScene.data.length !== data.length) {
+        lastScene = { stamp: stamp, data: new Uint8ClampedArray(data) };
+        return true;
+    }
+    let changed = 0;
+    for (let i = 0; i < data.length; i += 4) {
+        if (Math.abs(data[i] - lastScene.data[i]) > 16) changed += 1;
+    }
+    lastScene.data.set(data);
+    // A few changed thumbnail pixels mean a new label. Averaging the whole
+    // thumbnail hid that, so a still screen never started the next sweep.
+    return changed >= 3;
+}
+
+function boostScaleFor(longSide) {
+    if (longSide < 32 || longSide >= 2000) return 1;
+    const target = Math.min(longSide * 2, 2000);
+    const scale = target / longSide;
+    return scale >= 1.25 ? scale : 1;
+}
+
+function buildDecodePasses() {
+    const passes = [{ kind: 'fast' }];
+    // Upscaling a blurry code thickens the blur until the bars merge.
+    // When the painted frame was enlarged, also read the original crop.
+    if (paintScale >= 1.5 && lastCrop) passes.push({ kind: 'soft' });
+    passes.push({ kind: 'invert' });
+    TILT_ANGLES.forEach(angle => passes.push({ kind: 'tilt', angle: angle }));
+    return passes;
+}
+
+function extraPasses() {
+    const longSide = Math.max(canvas.width, canvas.height);
+    const scale = boostScaleFor(longSide);
+    if (scale <= 1) return [];
+    const passes = [{ kind: 'boost', scale: scale }];
+    TILT_ANGLES.forEach(angle => passes.push({ kind: 'tilt', angle: angle, boosted: true }));
+    return passes;
+}
+
+function foundCodes() {
+    if (!decodePlan) return [];
+    return Array.from(decodePlan.found.values());
+}
+
+function ensureBoostCanvas() {
+    if (!boostCanvas) {
+        boostCanvas = document.createElement('canvas');
+        boostContext = boostCanvas.getContext('2d', { willReadFrequently: true });
+    }
+}
+
+function ensurePassCanvas() {
+    if (!passCanvas) {
+        passCanvas = document.createElement('canvas');
+        passContext = passCanvas.getContext('2d', { willReadFrequently: true });
+    }
+}
+
+function drawBoost(scale) {
+    ensureBoostCanvas();
+    const dw = Math.max(1, Math.round(canvas.width * scale));
+    const dh = Math.max(1, Math.round(canvas.height * scale));
+    if (boostCanvas.width !== dw || boostCanvas.height !== dh) {
+        boostCanvas.width = dw;
+        boostCanvas.height = dh;
+    }
+    boostContext.setTransform(1, 0, 0, 1, 0, 0);
+    boostContext.imageSmoothingEnabled = true;
+    boostContext.imageSmoothingQuality = 'high';
+    boostContext.filter = 'contrast(1.6)';
+    boostContext.drawImage(canvas, 0, 0, dw, dh);
+    boostContext.filter = 'none';
+    boostScale = scale;
+    return { canvas: boostCanvas, context: boostContext, transform: { angle: 0, scale: scale } };
+}
+
+function drawSoft() {
+    if (!lastCrop || !video) return null;
+    if (!baseCanvas) {
+        baseCanvas = document.createElement('canvas');
+        baseContext = baseCanvas.getContext('2d', { willReadFrequently: true });
+    }
+    const sw = Math.max(1, Math.round(lastCrop.sw));
+    const sh = Math.max(1, Math.round(lastCrop.sh));
+    if (baseCanvas.width !== sw || baseCanvas.height !== sh) {
+        baseCanvas.width = sw;
+        baseCanvas.height = sh;
+    }
+    baseContext.setTransform(1, 0, 0, 1, 0, 0);
+    baseContext.imageSmoothingEnabled = true;
+    baseContext.imageSmoothingQuality = 'high';
+    baseContext.drawImage(video, lastCrop.sx, lastCrop.sy, lastCrop.sw, lastCrop.sh, 0, 0, sw, sh);
     return {
-        ...ZXING_READER_OPTIONS,
-        tryRotate: false
+        canvas: baseCanvas,
+        context: baseContext,
+        transform: { angle: 0, scale: 1 / paintScale }
     };
+}
+
+function drawTilt(angle, boosted) {
+    ensurePassCanvas();
+    let source = canvas;
+    let scale = 1;
+    if (boosted && boostScale > 1 && boostCanvas && boostCanvas.width) {
+        source = boostCanvas;
+        scale = boostScale;
+    } else if (paintScale >= 1.5 && baseCanvas && baseCanvas.width) {
+        source = baseCanvas;
+        scale = 1 / paintScale;
+    }
+    const rad = angle * Math.PI / 180;
+    const sin = Math.abs(Math.sin(rad));
+    const cos = Math.abs(Math.cos(rad));
+    const srcW = source.width;
+    const srcH = source.height;
+    const dw = Math.max(1, Math.ceil(srcW * cos + srcH * sin));
+    const dh = Math.max(1, Math.ceil(srcW * sin + srcH * cos));
+    if (passCanvas.width !== dw || passCanvas.height !== dh) {
+        passCanvas.width = dw;
+        passCanvas.height = dh;
+    }
+    passContext.setTransform(1, 0, 0, 1, 0, 0);
+    passContext.fillStyle = '#ffffff';
+    passContext.fillRect(0, 0, dw, dh);
+    passContext.imageSmoothingEnabled = true;
+    passContext.imageSmoothingQuality = 'high';
+    passContext.translate(dw / 2, dh / 2);
+    passContext.rotate(rad);
+    passContext.drawImage(source, -srcW / 2, -srcH / 2);
+    passContext.setTransform(1, 0, 0, 1, 0, 0);
+    return {
+        canvas: passCanvas,
+        context: passContext,
+        transform: { angle: angle, scale: scale, srcW: srcW, srcH: srcH, dstW: dw, dstH: dh }
+    };
+}
+
+function preparePass(pass) {
+    if (pass.kind === 'fast') {
+        return {
+            canvas: canvas,
+            context: context,
+            transform: { angle: 0, scale: 1 },
+            options: ZXING_READER_OPTIONS
+        };
+    }
+    if (pass.kind === 'boost') {
+        const prepared = drawBoost(pass.scale);
+        prepared.options = ZXING_READER_OPTIONS;
+        return prepared;
+    }
+    if (pass.kind === 'soft') {
+        const prepared = drawSoft();
+        if (!prepared) return null;
+        prepared.options = ZXING_READER_OPTIONS;
+        return prepared;
+    }
+    if (pass.kind === 'invert') {
+        return {
+            canvas: canvas,
+            context: context,
+            transform: { angle: 0, scale: 1 },
+            options: Object.assign({}, ZXING_READER_OPTIONS, { tryInvert: true, tryDenoise: true })
+        };
+    }
+    const prepared = drawTilt(pass.angle, !!pass.boosted);
+    prepared.options = Object.assign({}, ZXING_READER_OPTIONS, { tryRotate: false, tryInvert: false });
+    return prepared;
+}
+
+function mapDecodedPoints(points, transform) {
+    if (!points || !points.length) return null;
+    const mapped = points.map(point => {
+        if (!point || typeof point.x !== 'number' || typeof point.y !== 'number') return null;
+        let x = point.x;
+        let y = point.y;
+        if (transform && transform.angle) {
+            const rad = transform.angle * Math.PI / 180;
+            const cos = Math.cos(rad);
+            const sin = Math.sin(rad);
+            const dx = x - transform.dstW / 2;
+            const dy = y - transform.dstH / 2;
+            x = dx * cos + dy * sin + transform.srcW / 2;
+            y = -dx * sin + dy * cos + transform.srcH / 2;
+        }
+        if (transform && transform.scale && transform.scale !== 1) {
+            x /= transform.scale;
+            y /= transform.scale;
+        }
+        return { x: x, y: y };
+    });
+    return rectFromImagePoints(mapped);
+}
+
+async function readPrepared(prepared) {
+    const image = prepared.context.getImageData(0, 0, prepared.canvas.width, prepared.canvas.height);
+    const started = performance.now();
+    let codes = [];
+    if (decoderWorker) {
+        const payload = await workerRequest({
+            type: 'decode',
+            width: image.width,
+            height: image.height,
+            buffer: image.data.buffer,
+            options: prepared.options
+        }, [image.data.buffer]);
+        codes = payload.codes || [];
+    } else {
+        const results = await window.ZXingWASM.readBarcodes(image, prepared.options);
+        codes = (results || []).filter(result => result && result.text && !result.error).map(result => ({
+            text: result.text,
+            format: result.format || result.symbology || '',
+            points: result.position ? [
+                result.position.topLeft,
+                result.position.topRight,
+                result.position.bottomRight,
+                result.position.bottomLeft
+            ] : null
+        }));
+    }
+    const elapsed = performance.now() - started;
+    scanStats.decodes += 1;
+    scanStats.decodeMs += elapsed;
+    scanStats.lastMs = elapsed;
+    return codes.map(code => ({
+        value: code.text,
+        format: code.format || '',
+        rect: mapDecodedPoints(code.points, prepared.transform)
+    }));
 }
 
 async function detectFromCanvas() {
@@ -372,15 +694,43 @@ async function detectFromCanvas() {
     }
 
     if (!canvas.width || !canvas.height) return [];
-    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-    const results = await window.ZXingWASM.readBarcodes(imageData, zxingOptionsForFrame());
-    return (results || [])
-        .filter(result => result && result.text && !result.error)
-        .map(result => ({
-            value: result.text,
-            format: result.format || result.symbology || 'barcode',
-            rect: rectFromZxingPosition(result.position)
-        }));
+    if (sceneChanged() || !decodePlan) {
+        boostScale = 1;
+        decodePlan = { passes: buildDecodePasses(), index: 0, found: new Map(), extended: false };
+    } else if (decodePlan.index >= decodePlan.passes.length) {
+        if (!decodePlan.extended && decodePlan.found.size === 0) {
+            const extra = extraPasses();
+            decodePlan.extended = true;
+            if (extra.length) decodePlan.passes = decodePlan.passes.concat(extra);
+        }
+        if (decodePlan.index >= decodePlan.passes.length) {
+            scanStats.skips += 1;
+            scanStats.sweepDone = true;
+            return foundCodes();
+        }
+    }
+
+    const pass = decodePlan.passes[decodePlan.index];
+    decodePlan.index += 1;
+    scanStats.lastPass = pass.kind + (pass.angle ? ':' + pass.angle : '');
+    scanStats.sweepDone = decodePlan.index >= decodePlan.passes.length;
+    const prepared = preparePass(pass);
+    if (!prepared) return foundCodes();
+    try {
+        const codes = await readPrepared(prepared);
+        codes.forEach(code => {
+            const value = String(code.value || '').trim();
+            if (!value) return;
+            decodePlan.found.set(value, {
+                value: value,
+                format: code.format || '',
+                rect: code.rect
+            });
+        });
+    } catch (err) {
+        console.error('Barcode decode failed:', err);
+    }
+    return foundCodes();
 }
 
 function rectFromNativeBarcode(barcode) {
@@ -437,6 +787,7 @@ function normRectFromImageBox(x, y, w, h) {
 }
 
 function resetScanSession() {
+    resetDecodePlan();
     codeState = new Map();
     const list = document.getElementById('codeList');
     if (list) list.replaceChildren();
@@ -774,6 +1125,8 @@ function resetZoom() {
 function drawVideoFrame() {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
+    paintScale = 1;
+    lastCrop = null;
     if (!hardwareZoom && zoomLevel > 1 && vw > 0 && vh > 0) {
         // Digital zoom: send only the centered crop to the detector
         const sw = vw / zoomLevel;
@@ -793,16 +1146,17 @@ function drawVideoFrame() {
 // pass stays fast enough to repeat.
 function chooseScale(sourceWidth, sourceHeight, hasRegion) {
     const longSide = Math.max(sourceWidth, sourceHeight);
-    const cap = hasRegion ? 1800 : 1400;
+    const cap = hasRegion ? 1800 : 1200;
+    if (longSide <= 0) return 1;
     if (longSide > cap) return cap / longSide;
-    if (longSide >= 900) return 1;
-    if (longSide >= 450) return 2;
-    return 3;
+    // Small crops are enlarged so thin bars survive. A loose box still grows
+    // until the cap; the boost pass handles anything that is still too small.
+    if (longSide * 3 <= cap) return 3;
+    if (longSide * 2 <= cap) return 2;
+    return 1;
 }
 
-let lastPaintScale = 1;
-
-function paintScreenCanvas(smooth) {
+function paintScreenCanvas() {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     if (!vw || !vh) return false;
@@ -828,17 +1182,17 @@ function paintScreenCanvas(smooth) {
     if (sw < 8 || sh < 8) return false;
 
     const scale = chooseScale(sw, sh, hasRegion);
-    lastPaintScale = scale;
+    paintScale = scale;
+    lastCrop = { sx: sx, sy: sy, sw: sw, sh: sh };
     const dw = Math.max(1, Math.round(sw * scale));
     const dh = Math.max(1, Math.round(sh * scale));
     if (canvas.width !== dw || canvas.height !== dh) {
         canvas.width = dw;
         canvas.height = dh;
     }
-    // Screen captures are antialiased. A high-quality upscale rebuilds thin
-    // Code 128 bars; nearest-neighbor just enlarges the blur and misses.
-    // Downscales also stay smooth so a large frame doesn't sparkle.
-    context.imageSmoothingEnabled = smooth || scale < 1;
+    // Screen captures are antialiased. A high-quality scale rebuilds thin
+    // Code 128 bars; nearest-neighbor enlarges the blur and misses.
+    context.imageSmoothingEnabled = true;
     context.imageSmoothingQuality = 'high';
     context.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
     frameMap = { sx: sx, sy: sy, sw: sw, sh: sh, dw: dw, dh: dh, vw: vw, vh: vh };
@@ -877,29 +1231,18 @@ async function screenScanLoop(token) {
         if (!regionDrag && !awaitingRegion && video.readyState >= 2) {
             try {
                 let codes = [];
-                let painted = false;
-                if (paintScreenCanvas(true)) {
-                    painted = true;
+                if (paintScreenCanvas()) {
                     codes = await detectFromCanvas();
                     if (scanMode !== 'screen' || token !== screenLoopToken) return;
-                }
-                // A crisp, pixel-aligned barcode prefers nearest-neighbor.
-                // Try that only after a complete miss, and not on every idle frame.
-                if (painted && (!codes || !codes.length) && lastPaintScale > 1) {
-                    screenMissStreak += 1;
-                    if (screenMissStreak % 3 === 1 && paintScreenCanvas(false)) {
-                        codes = await detectFromCanvas();
-                        if (scanMode !== 'screen' || token !== screenLoopToken) return;
-                    }
-                } else {
-                    screenMissStreak = 0;
                 }
                 handleCodes(codes);
             } catch (err) {
                 console.error('Screen scan error:', err);
             }
         }
-        const wait = Math.max(0, SCREEN_SCAN_INTERVAL_MS - (performance.now() - started));
+        const sweepPending = decodePlan && decodePlan.index < decodePlan.passes.length;
+        const budget = sweepPending ? 0 : SCREEN_SCAN_INTERVAL_MS;
+        const wait = Math.max(0, budget - (performance.now() - started));
         await delay(wait);
     }
 }
