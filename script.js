@@ -22,9 +22,9 @@ let zoomApplyChain = Promise.resolve();
 let awbData = [];
 let awbMap = {};
 
-let lastScannedValue = '';
-let lastScanTime = 0;
 let detectorReinitTimer = null;
+let codeState = new Map();
+let frameMap = null;
 let cameraLoopRunning = false;
 let screenLoopToken = 0;
 let screenMissStreak = 0;
@@ -38,6 +38,8 @@ let regionRestored = false;
 let audioContext = null;
 
 const DUPLICATE_WINDOW_MS = 2000;
+const CODE_VISIBLE_MS = 1600;
+const HIGHLIGHT_VISIBLE_MS = 700;
 const SCREEN_SCAN_INTERVAL_MS = 120;
 const REGION_STORAGE_KEY = 'barcodeScreenRegion';
 const ZXING_READER_SRC = 'https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.7/dist/iife/reader/index.js';
@@ -56,7 +58,7 @@ const ZXING_READER_OPTIONS = {
     tryInvert: true,
     // The crop is scaled before it gets here. Extra downscaling smears thin bars.
     tryDownscale: false,
-    maxNumberOfSymbols: 8,
+    maxNumberOfSymbols: 32,
     textMode: 'Plain',
     formats: [
         'Code128', 'Code39', 'Code93', 'Codabar', 'ITF',
@@ -74,7 +76,7 @@ function resumeAudio() {
     audioContext.resume();
 }
 
-function playBeep() {
+function playBeep(offsetSec) {
     if (!audioContext) return;
     try {
         if (audioContext.state === 'suspended') audioContext.resume();
@@ -84,20 +86,21 @@ function playBeep() {
         gainNode.connect(audioContext.destination);
         oscillator.frequency.value = 800;
         oscillator.type = 'sine';
-        gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.2);
-        oscillator.start(audioContext.currentTime);
-        oscillator.stop(audioContext.currentTime + 0.2);
+        const t = audioContext.currentTime + (offsetSec || 0);
+        gainNode.gain.setValueAtTime(0.3, t);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, t + 0.2);
+        oscillator.start(t);
+        oscillator.stop(t + 0.2);
     } catch (err) {
         console.error('Beep failed:', err);
     }
 }
 
-function playSiren() {
+function playSiren(offsetSec) {
     if (!audioContext) return;
     try {
         if (audioContext.state === 'suspended') audioContext.resume();
-        const now = audioContext.currentTime;
+        const now = audioContext.currentTime + (offsetSec || 0);
         for (let i = 0; i < 3; i++) {
             const osc = audioContext.createOscillator();
             const gain = audioContext.createGain();
@@ -352,7 +355,8 @@ async function detectFromCanvas() {
             nativeFailureCount = 0;
             return barcodes.map(barcode => ({
                 value: barcode.rawValue || '',
-                format: barcode.format || ''
+                format: barcode.format || '',
+                rect: rectFromNativeBarcode(barcode)
             }));
         } catch (err) {
             nativeFailureCount += 1;
@@ -374,37 +378,243 @@ async function detectFromCanvas() {
         .filter(result => result && result.text && !result.error)
         .map(result => ({
             value: result.text,
-            format: result.format || result.symbology || 'barcode'
+            format: result.format || result.symbology || 'barcode',
+            rect: rectFromZxingPosition(result.position)
         }));
 }
 
-function pickBarcode(codes) {
-    if (!codes || !codes.length) return null;
-    for (let i = 0; i < codes.length; i++) {
-        const key = String(codes[i].value || '').trim();
-        if (key && awbMap[key]) return codes[i];
+function rectFromNativeBarcode(barcode) {
+    if (barcode.boundingBox) {
+        const box = barcode.boundingBox;
+        return normRectFromImageBox(box.x, box.y, box.width, box.height);
     }
-    return codes[0];
+    if (barcode.cornerPoints) return rectFromImagePoints(barcode.cornerPoints);
+    return null;
 }
 
-function handleDecoded(code) {
-    const barcodeValue = code.value;
-    if (!barcodeValue) return;
+function rectFromZxingPosition(position) {
+    if (!position) return null;
+    return rectFromImagePoints([
+        position.topLeft,
+        position.topRight,
+        position.bottomRight,
+        position.bottomLeft
+    ]);
+}
+
+function rectFromImagePoints(points) {
+    const pts = (points || []).filter(point => point && typeof point.x === 'number' && typeof point.y === 'number');
+    if (pts.length < 2) return null;
+    let minX = pts[0].x;
+    let minY = pts[0].y;
+    let maxX = pts[0].x;
+    let maxY = pts[0].y;
+    pts.forEach(point => {
+        if (point.x < minX) minX = point.x;
+        if (point.y < minY) minY = point.y;
+        if (point.x > maxX) maxX = point.x;
+        if (point.y > maxY) maxY = point.y;
+    });
+    return normRectFromImageBox(minX, minY, maxX - minX, maxY - minY);
+}
+
+// Detection coordinates are in the scaled crop. Map them onto the preview,
+// which is the full shared frame in screen mode and the scanned crop on camera.
+function normRectFromImageBox(x, y, w, h) {
+    const map = frameMap;
+    if (!map || !map.dw || !map.dh || !map.sw || !map.sh || !map.vw || !map.vh) return null;
+    const vx1 = map.sx + (x / map.dw) * map.sw;
+    const vy1 = map.sy + (y / map.dh) * map.sh;
+    const vx2 = map.sx + ((x + w) / map.dw) * map.sw;
+    const vy2 = map.sy + ((y + h) / map.dh) * map.sh;
+    const nx1 = vx1 / map.vw;
+    const ny1 = vy1 / map.vh;
+    const nx2 = vx2 / map.vw;
+    const ny2 = vy2 / map.vh;
+    const nx = Math.min(nx1, nx2);
+    const ny = Math.min(ny1, ny2);
+    return { x: nx, y: ny, w: Math.abs(nx2 - nx1), h: Math.abs(ny2 - ny1) };
+}
+
+function resetScanSession() {
+    codeState = new Map();
+    const list = document.getElementById('codeList');
+    if (list) list.replaceChildren();
+    const matches = document.getElementById('matchList');
+    if (matches) matches.replaceChildren();
+    clearHighlights();
+}
+
+function handleCodes(codes) {
     const now = Date.now();
+    const fresh = [];
+    const seenThisFrame = new Set();
+    (codes || []).forEach(code => {
+        const value = String(code.value || '').trim();
+        if (!value || seenThisFrame.has(value)) return;
+        seenThisFrame.add(value);
+        let state = codeState.get(value);
+        const isNew = !state || now - state.lastAnnounced > DUPLICATE_WINDOW_MS;
+        if (!state) {
+            state = { value: value, format: code.format || '', lastSeen: now, lastAnnounced: 0, rect: null };
+            codeState.set(value, state);
+        }
+        state.format = code.format || state.format;
+        state.lastSeen = now;
+        if (code.rect) state.rect = code.rect;
+        if (isNew) {
+            state.lastAnnounced = now;
+            fresh.push(state);
+        }
+    });
+    codeState.forEach((state, key) => {
+        if (now - state.lastSeen > 10000) codeState.delete(key);
+    });
+    renderCodeList(now);
+    renderHighlights(now);
+    if (!fresh.length) return;
 
-    // Same 2 second window as camera mode: one beep per repeated value.
-    if (barcodeValue === lastScannedValue && now - lastScanTime <= DUPLICATE_WINDOW_MS) return;
-    lastScannedValue = barcodeValue;
-    lastScanTime = now;
+    copyToClipboard(fresh.map(state => state.value).join('\n'));
+    let beepIndex = 0;
+    let sirenIndex = 0;
+    let anyMatch = false;
+    fresh.forEach(state => {
+        const row = awbMap[state.value];
+        if (row) {
+            anyMatch = true;
+            addMatchCard(row);
+            playSiren(sirenIndex * 0.4);
+            sirenIndex += 1;
+        } else {
+            playBeep(beepIndex * 0.14);
+            beepIndex += 1;
+        }
+    });
+    if (anyMatch) vibrateLong();
+    else vibrate();
+}
 
-    copyToClipboard(barcodeValue);
-    playBeep();
-    vibrate();
-    document.getElementById('resultText').textContent =
-        `Scanned: ${barcodeValue} (${code.format})`;
+function renderCodeList(now) {
+    const list = document.getElementById('codeList');
+    const status = document.getElementById('resultText');
+    if (!list || !status) return;
+    const visible = [];
+    codeState.forEach(state => {
+        if (now - state.lastSeen <= CODE_VISIBLE_MS) visible.push(state);
+    });
+    visible.sort((a, b) => (a.value < b.value ? -1 : a.value > b.value ? 1 : 0));
+    if (!visible.length) {
+        list.replaceChildren();
+        if (status.textContent.indexOf('code') !== -1 && status.textContent.indexOf('in view') !== -1) {
+            status.textContent = scanMode ? 'Scanning...' : status.textContent;
+        }
+        return;
+    }
+    status.textContent = visible.length === 1 ? '1 code in view' : visible.length + ' codes in view';
+    list.replaceChildren();
+    visible.forEach(state => {
+        const item = document.createElement('li');
+        const matched = !!awbMap[state.value];
+        item.className = matched ? 'code-item code-match' : 'code-item';
+        const value = document.createElement('span');
+        value.className = 'code-value';
+        value.textContent = state.value;
+        const format = document.createElement('span');
+        format.className = 'code-format';
+        format.textContent = state.format || '';
+        item.append(value, format);
+        if (matched) {
+            const tag = document.createElement('span');
+            tag.className = 'code-tag';
+            tag.textContent = 'AWB';
+            item.appendChild(tag);
+        }
+        list.appendChild(item);
+    });
+}
 
-    const found = awbMap[barcodeValue.trim()];
-    if (found) showMatch(found);
+function renderHighlights(now) {
+    const layer = document.getElementById('codeHighlights');
+    if (!layer) return;
+    layer.replaceChildren();
+    if (scanMode !== 'screen' && scanMode !== 'camera') return;
+    const content = highlightFrame();
+    const overlay = layer.getBoundingClientRect();
+    if (!content.width || !content.height) return;
+    const z = content.zoom || 1;
+    codeState.forEach(state => {
+        if (!state.rect || now - state.lastSeen > HIGHLIGHT_VISIBLE_MS) return;
+        const mark = document.createElement('div');
+        mark.className = awbMap[state.value] ? 'code-highlight match' : 'code-highlight';
+        const nx = 0.5 + (state.rect.x - 0.5) * z;
+        const ny = 0.5 + (state.rect.y - 0.5) * z;
+        mark.style.left = (content.left - overlay.left + nx * content.width) + 'px';
+        mark.style.top = (content.top - overlay.top + ny * content.height) + 'px';
+        mark.style.width = Math.max(0, state.rect.w * z * content.width) + 'px';
+        mark.style.height = Math.max(0, state.rect.h * z * content.height) + 'px';
+        const label = document.createElement('span');
+        label.textContent = state.value;
+        mark.appendChild(label);
+        layer.appendChild(mark);
+    });
+}
+
+function highlightFrame() {
+    if (scanMode === 'camera' && !hardwareZoom && zoomLevel > 1) {
+        const rect = video.getBoundingClientRect();
+        const z = zoomLevel;
+        const width = rect.width / z;
+        const height = rect.height / z;
+        return {
+            left: rect.left + (rect.width - width) / 2,
+            top: rect.top + (rect.height - height) / 2,
+            width: width,
+            height: height,
+            zoom: z
+        };
+    }
+    const content = videoContentRect();
+    content.zoom = 1;
+    return content;
+}
+
+function clearHighlights() {
+    const layer = document.getElementById('codeHighlights');
+    if (layer) layer.replaceChildren();
+}
+
+function addMatchCard(row) {
+    const awb = String(row.awbNumber || '').trim();
+    const list = document.getElementById('matchList');
+    if (!list || !awb) return;
+    const existing = Array.from(list.children).some(card => card.dataset.awb === awb);
+    if (existing) return;
+    const card = document.createElement('div');
+    card.className = 'match-result';
+    card.dataset.awb = awb;
+    const header = document.createElement('div');
+    header.className = 'match-header match-found';
+    header.textContent = 'AWB FOUND';
+    const details = document.createElement('div');
+    details.className = 'match-details';
+    Object.entries(row).forEach(([key, value]) => {
+        if (key === 'awbNumber') return;
+        const line = document.createElement('div');
+        line.className = 'match-row';
+        const keyEl = document.createElement('span');
+        keyEl.className = 'match-key';
+        keyEl.textContent = key + ': ';
+        const valueEl = document.createElement('span');
+        valueEl.className = 'match-value';
+        valueEl.textContent = value == null ? '' : String(value);
+        line.append(keyEl, valueEl);
+        details.appendChild(line);
+    });
+    card.append(header, details);
+    list.prepend(card);
+    try {
+        card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    } catch (err) { /* ignore */ }
 }
 
 async function startCamera() {
@@ -431,16 +641,31 @@ function stopStream() {
 }
 
 async function requestDisplayStream() {
+    // Hints only. Chrome still offers Entire screen, Window, and Chrome tab.
+    // displaySurface "window" pre-selects the Window pane (WhatsApp Desktop
+    // lives there, not under Chrome tab) and does not remove the other panes.
+    // selfBrowserSurface "include" keeps this tab in the Chrome tab list too.
+    // monitorTypeSurfaces "include" keeps Entire screen, which is the fallback
+    // when an app window is missing from the Window list.
+    // No cursor or frameRate max: those are applied after a choice and must
+    // not be able to fail the capture of a particular window.
     const attempts = [
         {
-            video: { frameRate: { ideal: 12, max: 15 }, cursor: 'never' },
+            video: { displaySurface: 'window' },
             audio: false,
             preferCurrentTab: false,
-            selfBrowserSurface: 'exclude',
+            selfBrowserSurface: 'include',
             surfaceSwitching: 'include',
             monitorTypeSurfaces: 'include'
         },
-        { video: { frameRate: { ideal: 12 } }, audio: false },
+        {
+            video: true,
+            audio: false,
+            preferCurrentTab: false,
+            selfBrowserSurface: 'include',
+            surfaceSwitching: 'include',
+            monitorTypeSurfaces: 'include'
+        },
         { video: true, audio: false }
     ];
     let lastError = null;
@@ -546,30 +771,6 @@ function resetZoom() {
     updateZoomUI();
 }
 
-function showMatch(row) {
-    const matchEl = document.getElementById('matchResult');
-    const headerEl = document.getElementById('matchHeader');
-    const detailsEl = document.getElementById('matchDetails');
-
-    headerEl.textContent = 'AWB FOUND';
-    headerEl.className = 'match-header match-found';
-
-    let html = '';
-    Object.entries(row).forEach(([key, value]) => {
-        if (key !== 'awbNumber') {
-            html += `<div class="match-row"><span class="match-key">${key}:</span> <span class="match-value">${value}</span></div>`;
-        }
-    });
-    detailsEl.innerHTML = html;
-    matchEl.style.display = 'block';
-    try {
-        matchEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    } catch (err) { /* older browsers */ }
-
-    playSiren();
-    vibrateLong();
-}
-
 function drawVideoFrame() {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
@@ -580,8 +781,10 @@ function drawVideoFrame() {
         const sx = (vw - sw) / 2;
         const sy = (vh - sh) / 2;
         context.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+        frameMap = { sx: sx, sy: sy, sw: sw, sh: sh, dw: canvas.width, dh: canvas.height, vw: vw, vh: vh };
     } else {
         context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        frameMap = { sx: 0, sy: 0, sw: vw, sh: vh, dw: canvas.width, dh: canvas.height, vw: vw, vh: vh };
     }
 }
 
@@ -638,6 +841,7 @@ function paintScreenCanvas(smooth) {
     context.imageSmoothingEnabled = smooth || scale < 1;
     context.imageSmoothingQuality = 'high';
     context.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+    frameMap = { sx: sx, sy: sy, sw: sw, sh: sh, dw: dw, dh: dh, vw: vw, vh: vh };
     return true;
 }
 
@@ -653,8 +857,7 @@ async function scanBarcode() {
             cameraLoopRunning = false;
             return;
         }
-        const chosen = pickBarcode(codes);
-        if (chosen) handleDecoded(chosen);
+        handleCodes(codes);
     } catch (err) {
         console.error('Error detecting barcode:', err);
         if (decoderKind === 'native') reinitDetector();
@@ -673,27 +876,25 @@ async function screenScanLoop(token) {
         }
         if (!regionDrag && !awaitingRegion && video.readyState >= 2) {
             try {
-                let chosen = null;
+                let codes = [];
                 let painted = false;
                 if (paintScreenCanvas(true)) {
                     painted = true;
-                    const codes = await detectFromCanvas();
+                    codes = await detectFromCanvas();
                     if (scanMode !== 'screen' || token !== screenLoopToken) return;
-                    chosen = pickBarcode(codes);
                 }
                 // A crisp, pixel-aligned barcode prefers nearest-neighbor.
-                // Try that only after a miss, and not on every idle frame.
-                if (painted && !chosen && lastPaintScale > 1) {
+                // Try that only after a complete miss, and not on every idle frame.
+                if (painted && (!codes || !codes.length) && lastPaintScale > 1) {
                     screenMissStreak += 1;
                     if (screenMissStreak % 3 === 1 && paintScreenCanvas(false)) {
-                        const codes = await detectFromCanvas();
+                        codes = await detectFromCanvas();
                         if (scanMode !== 'screen' || token !== screenLoopToken) return;
-                        chosen = pickBarcode(codes);
                     }
                 } else {
                     screenMissStreak = 0;
                 }
-                if (chosen) handleDecoded(chosen);
+                handleCodes(codes);
             } catch (err) {
                 console.error('Screen scan error:', err);
             }
@@ -750,8 +951,7 @@ async function startScanning() {
 
     scanMode = 'camera';
     scanning = true;
-    lastScannedValue = '';
-    lastScanTime = 0;
+    resetScanSession();
     document.getElementById('stopBtn').textContent = 'Stop Scanner';
     setControls({ camera: false, screen: false, stop: true });
     document.getElementById('resultText').textContent = 'Scanning...';
@@ -877,17 +1077,18 @@ function placeRegionBox(region) {
 function updateScreenHint() {
     const hint = document.getElementById('screenHint');
     const prompt = document.getElementById('regionPrompt');
+    const windowHint = ' If a window isn\'t listed, share Entire screen and drag over it.';
     if (awaitingRegion) {
-        hint.textContent = 'Drag a rectangle on the preview. Only that area is scanned.';
+        hint.textContent = 'Drag a rectangle on the preview. Only that area is scanned.' + windowHint;
         prompt.textContent = regionRestored ? 'Drag a new rectangle' : 'Drag to select the barcode area';
         prompt.classList.add('active');
     } else if (screenRegion) {
-        hint.textContent = regionRestored
+        hint.textContent = (regionRestored
             ? 'Scanning your last selection. Drag to adjust it, or use Full frame.'
-            : 'Scanning the selected area. Drag to adjust it, or use Full frame.';
+            : 'Scanning the selected area. Drag to adjust it, or use Full frame.') + windowHint;
         prompt.classList.remove('active');
     } else {
-        hint.textContent = 'Scanning the whole shared screen. Drag a rectangle to limit it.';
+        hint.textContent = 'Scanning the whole shared screen. Drag a rectangle to limit it.' + windowHint;
         prompt.classList.remove('active');
     }
 
@@ -1020,8 +1221,7 @@ async function startScreenScan() {
     scanning = true;
     stream = displayStream;
     videoTrack = null;
-    lastScannedValue = '';
-    lastScanTime = 0;
+    resetScanSession();
     regionDrag = null;
     const saved = loadSavedRegion();
     if (saved) {
@@ -1102,6 +1302,7 @@ function stopActiveScan(message) {
     document.getElementById('regionLayer').classList.remove('active');
     document.getElementById('regionBox').classList.remove('visible');
     document.getElementById('regionPrompt').classList.remove('active');
+    clearHighlights();
     document.getElementById('stopBtn').textContent = 'Stop Scanner';
     setControls({ camera: true, screen: true, stop: false });
     document.getElementById('resultText').textContent = message
@@ -1145,11 +1346,13 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (typeof ResizeObserver === 'function') {
         const observer = new ResizeObserver(() => {
             if (scanMode === 'screen') renderRegionOverlay();
+            renderHighlights(Date.now());
         });
         observer.observe(video);
     } else {
         window.addEventListener('resize', () => {
             if (scanMode === 'screen') renderRegionOverlay();
+            renderHighlights(Date.now());
         });
     }
 
@@ -1185,7 +1388,10 @@ window.addEventListener('DOMContentLoaded', async () => {
         awbMap = {};
         await clearAWBFromDB();
         updateAWBStatus();
-        document.getElementById('matchResult').style.display = 'none';
+        const matches = document.getElementById('matchList');
+        if (matches) matches.replaceChildren();
+        codeState.forEach(state => { state.lastSeen = 0; });
+        renderCodeList(Date.now());
     });
 
     // Upload area drag & drop

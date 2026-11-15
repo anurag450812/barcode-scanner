@@ -26,6 +26,7 @@
         <div class="scanner-container" id="scannerContainer">
             <video id="video" autoplay muted playsinline></video>
             <canvas id="canvas"></canvas>
+            <div id="codeHighlights" class="code-highlights"></div>
             <div id="regionLayer" class="region-layer">
                 <div id="regionBox" class="region-box"></div>
                 <div id="regionPrompt" class="region-prompt">Drag to select the barcode area</div>
@@ -49,13 +50,12 @@
             <button id="screenBtn" type="button">Scan Screen</button>
             <button id="stopBtn" type="button" disabled>Stop Scanner</button>
         </div>
+        <p class="share-note">The share picker has Entire screen, Window, and Chrome tab. If a window isn't listed, share Entire screen and drag over it.</p>
         <div id="result" aria-live="polite">
             <p id="resultText">Waiting for scan...</p>
+            <ul id="codeList" class="code-list"></ul>
         </div>
-        <div id="matchResult" class="match-result" style="display:none;">
-            <div id="matchHeader" class="match-header">AWB FOUND</div>
-            <div id="matchDetails" class="match-details"></div>
-        </div>
+        <div id="matchList" class="match-list"></div>
     </div>
 
     <script src="script.js"></script>

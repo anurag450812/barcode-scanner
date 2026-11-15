@@ -1,6 +1,6 @@
 # Barcode Scanner
 
-A static single-page scanner for return AWBs. Upload an Excel file of airway bill numbers, then scan barcodes with the phone camera or from a desktop screen share. A matching AWB is copied to the clipboard, and the row's other columns are shown on a green card.
+A static single-page scanner for return AWBs. Upload an Excel file of airway bill numbers, then scan barcodes with the phone camera or from a desktop screen share. Every code in view is listed. Each one that matches a loaded AWB is copied to the clipboard and shown on its own green card.
 
 No build step and no backend. Open `index.html`, or use the site deployed from `master`:
 
@@ -11,9 +11,9 @@ https://returnsbarcodecopy.netlify.app
 1. Choose an `.xlsx` or `.xls` file, or drop it on the upload area.
 2. The first sheet is read in the browser with SheetJS. The AWB column is the header whose name contains "awb", otherwise the first column.
 3. The rows are stored in IndexedDB on this device, so they are still there after a refresh. **Clear Data** removes them.
-4. Every successful scan is copied to the clipboard, with a short beep and a vibration on phones.
-5. If the scanned text exactly matches a loaded AWB, a green **AWB FOUND** card lists that row's other columns and a siren plays. A scan that is not in the list keeps scanning quietly: no siren and no error card.
-6. The same value is not announced again for 2 seconds.
+4. Every code found in a frame is copied to the clipboard (one value, or several on separate lines), with a short beep for each new code and a vibration on phones.
+5. Each scanned text that exactly matches a loaded AWB gets its own green **AWB FOUND** card listing that row's other columns, and a siren plays. A code that is not in the list keeps scanning quietly: no siren and no error card.
+6. The same code is not announced again for 2 seconds.
 
 ## Camera mode
 
@@ -22,18 +22,19 @@ https://returnsbarcodecopy.netlify.app
 - Pinch-level zoom uses the camera's own zoom when the phone supports it, and a digital crop otherwise.
 - **Stop Scanner** releases the camera.
 - On Android Chrome this uses the built-in Barcode Detection API.
+- Several codes in one frame are all listed, the same as screen mode.
 
 ## Screen mode
 
 **Scan Screen** is for doing the whole job in desktop Chrome or Edge: upload the Excel there, share the screen the labels are on, and let the page read them.
 
-1. Click **Scan Screen** and pick a whole screen, a window, or a browser tab. The current tab is hidden from the picker so the preview does not recurse.
+1. Click **Scan Screen**. The picker offers **Entire screen**, **Window**, and **Chrome tab**, and opens on Window so a desktop app is in front. WhatsApp Desktop is a window, not a Chrome tab. WhatsApp Web is a Chrome tab. If a window is missing from the list, or its capture is black, choose **Entire screen** and drag the rectangle over that window. A window can also hide itself from capture at the Windows level; this page cannot turn that off, and in that case the entire-screen image has a blank hole where the window is.
 2. Drag a rectangle on the live preview around the barcode. Only that region is scanned. Draw the box tightly around the code; small codes on a large desktop are much more reliable that way.
 3. Drag again to replace the rectangle. **Reselect** clears it, forgets the saved rectangle, and waits for a new one (scanning pauses until you draw). **Full frame** scans the entire shared image and forgets the rectangle.
 4. The last rectangle is remembered in this browser, as fractions of the frame, and applied the next time you share.
 5. **Stop Sharing** ends the capture. Ending it from the browser's own "Stop sharing" bar does the same thing and returns the page to idle.
 
-Detected codes follow the camera rules: clipboard, beep, green AWB card and siren on a match, quiet continue otherwise, and the same 2 second duplicate window.
+Every code in the region is read, listed with its format, and outlined on the preview. Each one is checked against the AWB sheet. Each matched AWB gets its own green card. A new code beeps once, and a new match plays the siren once. The same code is not announced again for 2 seconds, so a static screen does not keep beeping. The camera uses the same multi-code path.
 
 ## Sounds
 
