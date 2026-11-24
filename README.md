@@ -8,8 +8,9 @@ A web-based barcode scanner that automatically copies scanned barcodes to clipbo
 - 📋 Automatically copies barcode text to clipboard
 - 🔊 Audio feedback on successful scan
 - 📳 Vibration feedback (mobile devices)
-- 📷 Uses device's rear camera
-- 🎯 Native Barcode Detection API for fast scanning
+- 📷 Uses the rear camera when the device has one, otherwise any camera
+- 🎯 Native Barcode Detection API when the browser provides it
+- 🔄 ZXing fallback so scanning works in Edge, Firefox, Safari, and desktop Chrome
 
 ## Supported Barcode Formats
 
@@ -25,16 +26,16 @@ A web-based barcode scanner that automatically copies scanned barcodes to clipbo
 
 ## Usage
 
-1. Open `index.html` in Chrome on Android (or any browser supporting the Barcode Detection API)
+1. Open the site in a modern browser (Chrome, Edge, Firefox, or Safari, on a phone or a computer)
 2. Click "Start Scanner" and grant camera permissions
 3. Point the camera at a barcode
 4. The barcode text will automatically copy to clipboard with a beep and vibration
 
 ## Browser Compatibility
 
-This app uses the native Barcode Detection API, which is currently supported in:
-- Chrome on Android
-- Chrome/Edge on desktop (with experimental flags enabled)
+Scanning uses the native Barcode Detection API when `BarcodeDetector` is available (Chrome on Android, and desktop browsers that enable it). Everywhere else — including Microsoft Edge and Chrome on Windows, Firefox, and Safari — the page loads `@zxing/library` from a CDN and decodes the same formats in JavaScript. No build step is required.
+
+The rear camera is requested as a preference. Laptops and desktops with only a front or built-in webcam still open that camera.
 
 ## Live Demo
 
