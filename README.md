@@ -23,7 +23,7 @@ https://returnsbarcodecopy.netlify.app
 - **Stop Scanner** releases the camera.
 - On Android Chrome this uses the built-in Barcode Detection API.
 - Several codes in one frame are all listed, the same as screen mode.
-- On a desktop, where the native detector is missing, the camera uses the same tilt and enlarge passes as screen mode. Hold the phone or the label steady for a tilted 1D code.
+- On a desktop, where the native detector is missing, the camera uses the same rotation, tilt, and enlarge passes as screen mode. Hold the phone or the label steady for a tilted or blurry 1D code.
 
 ## Screen mode
 
@@ -37,7 +37,7 @@ https://returnsbarcodecopy.netlify.app
 
 Every code in the region is read, listed with its format, and outlined on the preview. Each one is checked against the AWB sheet. Each matched AWB gets its own green card. A new code beeps once, and a new match plays the siren once. The same code is not announced again for 2 seconds, so a static screen does not keep beeping. The camera uses the same multi-code path.
 
-Tilted labels are read too. QR codes are detected at any angle. A 1D code has to cross a straight scan line, so the page turns the crop through 15, 30, 45 and 60 degrees in both directions, and also checks it sideways. The first pass each time the picture changes is the fast one (level and sideways codes, including QR). The slower tilt, contrast, and enlarge passes then run one per frame while the picture holds still, in a background decoder so the page stays responsive. A moving picture stays on the fast pass. Draw the box tightly around a small code; a loose box is enlarged, and a second enlarged pass runs when the first one finds nothing.
+Tilted and sideways labels are read too. QR codes are detected at any angle. A 1D code has to cross a straight scan line, so each frame tries one orientation (upright, 90, 270, then 180) with ZXing's try-harder hint, and a moving picture alternates that orientation instead of trying all of them at once. While the picture holds still and nothing has been read, the page then stretches contrast, upscales a small crop, and runs a Code 128 scanline check for a blurry sideways label. Tilted labels still go through 15, 30, 45 and 60 degrees in both directions, one angle per frame, in a background decoder so the page stays responsive. The upright pass reads the full format list. Rotated, contrast, and tilt passes leave out EAN-8 and UPC-E so a blurry Code 128 is not reported as a short retail code. Draw the box tightly around a small code; a loose box is enlarged, and a second enlarged pass runs when the first one finds nothing. On Android, where the native detector misses a rotated code, the same one-orientation-per-frame retry runs, and a still frame that none of those orientations can read gets the scanline check once.
 
 ## Sounds
 
@@ -65,7 +65,9 @@ A selected region that is only a few hundred pixels wide is scaled up (2x or 3x)
 
 - `index.html` — page structure
 - `script.js` — Excel loading, camera scan, screen share, region selection, decoders
+- `scanline.js` — Code 128 scanline rescue for a blurry sideways label
 - `style.css` — layout
+- `decoder-worker.js` — ZXing decode off the UI thread
 
 ## License
 

@@ -74,26 +74,20 @@ const NATIVE_FORMATS = [
 ];
 
 // Courier AWBs are usually Code 128. QR is included because labels often carry one.
-// Names are the zxing-wasm canonical format names.
-const ZXING_FORMATS = [
-    'Code128', 'Code39', 'Code93', 'Codabar', 'ITF',
-    'QRCode', 'EAN13', 'EAN8', 'UPCA', 'UPCE',
-    'PDF417', 'DataMatrix', 'Aztec'
-];
-// tryRotate covers 90, 180 and 270 only. A tilted 1D label needs the image
-// itself turned until a row crosses every bar. QR does not need these angles.
+// Names are the zxing-wasm canonical format names. The upright pass keeps the
+// full list. Rotated and cleaned-up passes use the shorter list so a blurry
+// Code 128 is not reported as an EAN-8 or UPC-E.
+const ZXING_FORMATS = ScanlineDecoder.ZXING_FORMATS;
+const ZXING_READER_OPTIONS = ScanlineDecoder.readerOptions(ZXING_FORMATS);
+const ZXING_HARD_OPTIONS = ScanlineDecoder.readerOptions(ScanlineDecoder.ZXING_HARD_FORMATS);
+// A tilted 1D label needs the image itself turned until a row crosses every
+// bar. Sideways labels are handled by the quarter-turn passes, one per frame.
 const TILT_ANGLES = [15, -15, 30, -30, 45, -45, 60, -60];
-const ZXING_READER_OPTIONS = {
-    tryHarder: true,
-    tryRotate: true,
-    tryInvert: false,
-    tryDenoise: false,
-    // The crop is scaled before it gets here. Extra downscaling smears thin bars.
-    tryDownscale: false,
-    maxNumberOfSymbols: 32,
-    textMode: 'Plain',
-    formats: ZXING_FORMATS
-};
+let liveQuarterCursor = 0;
+let nativeQuarterCursor = 0;
+let nativeHeld = new Map();
+let nativeEmptyStreak = 0;
+let nativeRescued = false;
 
 function resumeAudio() {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -419,6 +413,9 @@ function resetDecodePlan() {
     decodePlan = null;
     lastScene = null;
     boostScale = 1;
+    nativeHeld = new Map();
+    nativeEmptyStreak = 0;
+    nativeRescued = false;
     scanStats.decodes = 0;
     scanStats.decodeMs = 0;
     scanStats.skips = 0;
@@ -459,7 +456,21 @@ function boostScaleFor(longSide) {
 }
 
 function buildDecodePasses() {
-    const passes = [{ kind: 'fast' }];
+    const quarters = ScanlineDecoder.LIVE_QUARTERS;
+    const start = liveQuarterCursor % quarters.length;
+    // Advance once per plan. A moving picture only runs the first pass, so
+    // the orientation changes every frame instead of every pass.
+    liveQuarterCursor += 1;
+    const passes = [];
+    for (let i = 0; i < quarters.length; i++) {
+        passes.push({ kind: 'rot', quarters: quarters[(start + i) % quarters.length] });
+    }
+    // Grayscale, contrast stretch, and a modest upscale once the plain
+    // orientations have missed. Still one pass per frame.
+    passes.push({ kind: 'prep', quarters: 0 });
+    passes.push({ kind: 'prep', quarters: 1 });
+    passes.push({ kind: 'prep', quarters: 3 });
+    passes.push({ kind: 'rescue' });
     // Upscaling a blurry code thickens the blur until the bars merge.
     // When the painted frame was enlarged, also read the original crop.
     if (paintScale >= 1.5 && lastCrop) passes.push({ kind: 'soft' });
@@ -575,7 +586,72 @@ function drawTilt(angle, boosted) {
     };
 }
 
+function paintRGBA(rgba, width, height) {
+    ensurePassCanvas();
+    if (passCanvas.width !== width || passCanvas.height !== height) {
+        passCanvas.width = width;
+        passCanvas.height = height;
+    }
+    passContext.putImageData(new ImageData(rgba, width, height), 0, 0);
+    return passCanvas;
+}
+
+function drawQuarter(quarters) {
+    if (!quarters) {
+        return {
+            canvas: canvas,
+            context: context,
+            transform: { angle: 0, scale: 1, quarters: 0, rotW: canvas.width, rotH: canvas.height }
+        };
+    }
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    const turned = ScanlineDecoder.rotateQuarter(image.data, image.width, image.height, quarters);
+    paintRGBA(turned.data, turned.width, turned.height);
+    return {
+        canvas: passCanvas,
+        context: passContext,
+        transform: { angle: 0, scale: 1, quarters: quarters, rotW: turned.width, rotH: turned.height }
+    };
+}
+
+function drawPrepped(quarters) {
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    let prepared = ScanlineDecoder.contrastStretch(image.data, image.width, image.height);
+    const longSide = Math.max(prepared.width, prepared.height);
+    let scale = 1;
+    if (longSide > 0 && longSide < 720) {
+        scale = longSide < 360 ? 3 : 2;
+        prepared = ScanlineDecoder.scaleImage(prepared.data, prepared.width, prepared.height, scale);
+    }
+    if (quarters) {
+        prepared = ScanlineDecoder.rotateQuarter(prepared.data, prepared.width, prepared.height, quarters);
+    }
+    paintRGBA(prepared.data, prepared.width, prepared.height);
+    return {
+        canvas: passCanvas,
+        context: passContext,
+        transform: {
+            angle: 0,
+            scale: scale,
+            quarters: quarters || 0,
+            rotW: prepared.width,
+            rotH: prepared.height
+        }
+    };
+}
+
 function preparePass(pass) {
+    if (pass.kind === 'rescue') return { rescue: true };
+    if (pass.kind === 'rot') {
+        const prepared = drawQuarter(pass.quarters || 0);
+        prepared.options = pass.quarters ? ZXING_HARD_OPTIONS : ZXING_READER_OPTIONS;
+        return prepared;
+    }
+    if (pass.kind === 'prep') {
+        const prepared = drawPrepped(pass.quarters || 0);
+        prepared.options = ZXING_HARD_OPTIONS;
+        return prepared;
+    }
     if (pass.kind === 'fast') {
         return {
             canvas: canvas,
@@ -604,7 +680,7 @@ function preparePass(pass) {
         };
     }
     const prepared = drawTilt(pass.angle, !!pass.boosted);
-    prepared.options = Object.assign({}, ZXING_READER_OPTIONS, { tryRotate: false, tryInvert: false });
+    prepared.options = ZXING_HARD_OPTIONS;
     return prepared;
 }
 
@@ -614,6 +690,16 @@ function mapDecodedPoints(points, transform) {
         if (!point || typeof point.x !== 'number' || typeof point.y !== 'number') return null;
         let x = point.x;
         let y = point.y;
+        if (transform && transform.quarters && window.ScanlineDecoder) {
+            const back = ScanlineDecoder.unrotatePoint(
+                { x: x, y: y },
+                transform.rotW,
+                transform.rotH,
+                transform.quarters
+            );
+            x = back.x;
+            y = back.y;
+        }
         if (transform && transform.angle) {
             const rad = transform.angle * Math.PI / 180;
             const cos = Math.cos(rad);
@@ -669,29 +755,113 @@ async function readPrepared(prepared) {
     }));
 }
 
+function rescueCodes() {
+    if (!window.ScanlineDecoder || !canvas.width || !canvas.height) return [];
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    let pixels = image.data;
+    let width = image.width;
+    let height = image.height;
+    const longSide = Math.max(width, height);
+    if (longSide > 1100) {
+        const scaled = ScanlineDecoder.scaleImage(pixels, width, height, 1100 / longSide);
+        pixels = scaled.data;
+        width = scaled.width;
+        height = scaled.height;
+    }
+    const started = performance.now();
+    const hit = ScanlineDecoder.readHardBarcode(pixels, width, height);
+    const elapsed = performance.now() - started;
+    scanStats.decodes += 1;
+    scanStats.decodeMs += elapsed;
+    scanStats.lastMs = elapsed;
+    if (!hit || !hit.text) return [];
+    return [{ value: hit.text, format: hit.format || 'Code128', rect: null }];
+}
+
+function rememberCode(code) {
+    const value = String(code.value || '').trim();
+    if (!value || !decodePlan) return;
+    decodePlan.found.set(value, {
+        value: value,
+        format: code.format || '',
+        rect: code.rect || null
+    });
+}
+
+async function detectNative() {
+    const changed = sceneChanged();
+    if (changed) {
+        nativeHeld = new Map();
+        nativeEmptyStreak = 0;
+        nativeRescued = false;
+    }
+    const quarters = ScanlineDecoder.LIVE_QUARTERS;
+    const quarter = quarters[nativeQuarterCursor % quarters.length];
+    nativeQuarterCursor += 1;
+    try {
+        const prepared = drawQuarter(quarter);
+        const barcodes = await barcodeDetector.detect(prepared.canvas);
+        nativeFailureCount = 0;
+        barcodes.forEach(barcode => {
+            const value = String(barcode.rawValue || '').trim();
+            if (!value) return;
+            nativeHeld.set(value, {
+                value: value,
+                format: barcode.format || '',
+                rect: rectFromNativePrepared(barcode, prepared.transform)
+            });
+        });
+        if (!nativeHeld.size) {
+            nativeEmptyStreak += 1;
+            // One scanline rescue per still scene, after each orientation has
+            // had a frame. A moving camera stays on the rotate-and-retry path.
+            if (!changed && !nativeRescued && nativeEmptyStreak >= quarters.length) {
+                nativeRescued = true;
+                rescueCodes().forEach(code => nativeHeld.set(code.value, code));
+            }
+        }
+        return Array.from(nativeHeld.values());
+    } catch (err) {
+        nativeFailureCount += 1;
+        if (nativeFailureCount >= 3) {
+            console.warn('Native detector failed, switching to ZXing');
+            await loadZXingDecoder();
+            decoderKind = 'zxing';
+            nativeFailureCount = 0;
+            return detectFromCanvas();
+        }
+        throw err;
+    }
+}
+
+function rectFromNativePrepared(barcode, transform) {
+    if (!transform || !transform.quarters) return rectFromNativeBarcode(barcode);
+    const points = barcode.cornerPoints && barcode.cornerPoints.length
+        ? barcode.cornerPoints
+        : boxCorners(barcode.boundingBox);
+    if (!points) return null;
+    const mapped = points.map(point => ScanlineDecoder.unrotatePoint(
+        point,
+        transform.rotW,
+        transform.rotH,
+        transform.quarters
+    ));
+    return rectFromImagePoints(mapped);
+}
+
+function boxCorners(box) {
+    if (!box) return null;
+    return [
+        { x: box.x, y: box.y },
+        { x: box.x + box.width, y: box.y },
+        { x: box.x + box.width, y: box.y + box.height },
+        { x: box.x, y: box.y + box.height }
+    ];
+}
+
 async function detectFromCanvas() {
     if (!decoderKind) return [];
-    if (decoderKind === 'native') {
-        try {
-            const barcodes = await barcodeDetector.detect(canvas);
-            nativeFailureCount = 0;
-            return barcodes.map(barcode => ({
-                value: barcode.rawValue || '',
-                format: barcode.format || '',
-                rect: rectFromNativeBarcode(barcode)
-            }));
-        } catch (err) {
-            nativeFailureCount += 1;
-            if (nativeFailureCount >= 3) {
-                console.warn('Native detector failed, switching to ZXing');
-                await loadZXingDecoder();
-                decoderKind = 'zxing';
-                nativeFailureCount = 0;
-                return detectFromCanvas();
-            }
-            throw err;
-        }
-    }
+    if (decoderKind === 'native') return detectNative();
 
     if (!canvas.width || !canvas.height) return [];
     if (sceneChanged() || !decodePlan) {
@@ -712,21 +882,20 @@ async function detectFromCanvas() {
 
     const pass = decodePlan.passes[decodePlan.index];
     decodePlan.index += 1;
-    scanStats.lastPass = pass.kind + (pass.angle ? ':' + pass.angle : '');
+    scanStats.lastPass = pass.kind
+        + (pass.quarters ? ':' + (pass.quarters * 90) : '')
+        + (pass.angle ? ':' + pass.angle : '');
     scanStats.sweepDone = decodePlan.index >= decodePlan.passes.length;
     const prepared = preparePass(pass);
     if (!prepared) return foundCodes();
+    if (prepared.rescue) {
+        scanStats.lastPass = 'rescue';
+        if (decodePlan.found.size === 0) rescueCodes().forEach(rememberCode);
+        return foundCodes();
+    }
     try {
         const codes = await readPrepared(prepared);
-        codes.forEach(code => {
-            const value = String(code.value || '').trim();
-            if (!value) return;
-            decodePlan.found.set(value, {
-                value: value,
-                format: code.format || '',
-                rect: code.rect
-            });
-        });
+        codes.forEach(rememberCode);
     } catch (err) {
         console.error('Barcode decode failed:', err);
     }
