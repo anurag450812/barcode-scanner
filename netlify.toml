@@ -1,0 +1,5 @@
+# Static site. package.json exists so `npm test` can run the decoder tests.
+# There is no site build. The command overrides Netlify's package.json detection.
+[build]
+  publish = "."
+  command = "echo Static site, no build"

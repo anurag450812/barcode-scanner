@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "scripts": {
+    "test": "node --test test/decode.test.mjs"
+  },
+  "devDependencies": {
+    "pngjs": "^7.0.0",
+    "zxing-wasm": "3.1.7"
+  }
+}
