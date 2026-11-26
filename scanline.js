@@ -375,6 +375,57 @@
         return out;
     }
 
+    // A label on a screen capture is a short run of bars in a long line of
+    // desktop. Stretching the whole line lets the background set the contrast,
+    // and the bars disappear. Keep the span that actually has edges.
+    function activeSpan(line) {
+        const n = line.length;
+        if (n < 32) return [0, n];
+        const edge = new Float32Array(n);
+        for (let i = 1; i < n; i++) edge[i] = Math.abs(line[i] - line[i - 1]);
+        // Wide enough to bridge the gaps inside one symbol, narrow enough that
+        // a blank desktop stays dark.
+        const radius = 18;
+        const smooth = new Float32Array(n);
+        let roll = 0;
+        for (let i = 0; i < n; i++) {
+            roll += edge[i];
+            if (i > radius * 2) roll -= edge[i - radius * 2 - 1];
+            smooth[i] = roll;
+        }
+        let max = 0;
+        let peak = 0;
+        for (let i = 0; i < n; i++) {
+            if (smooth[i] > max) {
+                max = smooth[i];
+                peak = i;
+            }
+        }
+        if (max <= 0) return [0, n];
+        const threshold = max * 0.28;
+        let start = peak;
+        let end = peak + 1;
+        while (start > 0 && smooth[start - 1] >= threshold) start--;
+        while (end < n && smooth[end] >= threshold) end++;
+        const pad = radius + 8;
+        start = Math.max(0, start - pad);
+        end = Math.min(n, end + pad);
+        if (end - start < 48) return [0, n];
+        return [start, end];
+    }
+
+    function readLine(line) {
+        const span = activeSpan(line);
+        const slice = span[0] === 0 && span[1] === line.length ? line : line.slice(span[0], span[1]);
+        const forward = decodeLine(slice);
+        const backward = decodeLine(reversed(slice));
+        if (forward && backward && forward.text !== backward.text && Math.abs(forward.corr - backward.corr) < 0.06) {
+            return null;
+        }
+        if (forward && (!backward || forward.corr >= backward.corr)) return forward;
+        return backward || forward;
+    }
+
     function readHardBarcode(data, width, height) {
         if (!data || width < 24 || height < 24) return null;
         const gray = luminance(data, width, height);
@@ -386,10 +437,8 @@
             const bands = peakBands(energy);
             for (let b = 0; b < bands.length; b++) {
                 const line = medianLine(gray, width, height, alongY, bands[b]);
-                const forward = decodeLine(line);
-                const backward = decodeLine(reversed(line));
-                if (forward) candidates.push(forward);
-                if (backward) candidates.push(backward);
+                const hit = readLine(line);
+                if (hit) candidates.push(hit);
             }
         }
         if (!candidates.length) return null;
@@ -527,6 +576,53 @@
         }, extra || {});
     }
 
+    // Screen captures stay at videoWidth x videoHeight. Shrinking a 1080p
+    // frame squeezes a label that only fills part of the monitor. A selected
+    // region is enlarged only when it is actually small.
+    function screenScale(width, height, hasRegion) {
+        const longSide = Math.max(width || 0, height || 0);
+        if (!hasRegion || longSide <= 0) return 1;
+        if (longSide <= 220) return 3;
+        if (longSide <= 420) return 2;
+        return 1;
+    }
+
+    // region is fractions of the capture, after letterboxing is removed.
+    // The preview's CSS size and devicePixelRatio are not part of this.
+    function screenSourceRect(videoWidth, videoHeight, region) {
+        const hasRegion = !!(region && region.w > 0 && region.h > 0);
+        let sx = 0;
+        let sy = 0;
+        let sw = videoWidth;
+        let sh = videoHeight;
+        if (hasRegion) {
+            sx = Math.round(region.x * videoWidth);
+            sy = Math.round(region.y * videoHeight);
+            sw = Math.round(region.w * videoWidth);
+            sh = Math.round(region.h * videoHeight);
+            const padX = Math.round(sw * 0.08);
+            const padY = Math.round(sh * 0.1);
+            sx = Math.max(0, sx - padX);
+            sy = Math.max(0, sy - padY);
+            sw = Math.min(videoWidth - sx, sw + padX * 2);
+            sh = Math.min(videoHeight - sy, sh + padY * 2);
+        }
+        sw = Math.max(0, sw);
+        sh = Math.max(0, sh);
+        return { sx: sx, sy: sy, sw: sw, sh: sh, scale: screenScale(sw, sh, hasRegion) };
+    }
+
+    // delta is how many 32x18 thumbnail pixels changed. A screen share jitters
+    // by a few of those (cursor, compression) on every frame. Resetting on
+    // that noise keeps the sweep on its first pass, so the scanline fallback
+    // never runs. Camera frames use the old tight threshold.
+    function shouldResetSweep(delta, sizeChanged, sweepOpen, screen) {
+        if (sizeChanged || !isFinite(delta)) return true;
+        if (!screen) return delta >= 3;
+        if (sweepOpen) return delta >= 120;
+        return delta >= 40;
+    }
+
     root.ScanlineDecoder = {
         ZXING_FORMATS: ZXING_FORMATS,
         ZXING_HARD_FORMATS: ZXING_HARD_FORMATS,
@@ -540,6 +636,9 @@
         rotateQuarter: rotateQuarter,
         contrastStretch: contrastStretch,
         scaleImage: scaleImage,
-        unrotatePoint: unrotatePoint
+        unrotatePoint: unrotatePoint,
+        screenScale: screenScale,
+        screenSourceRect: screenSourceRect,
+        shouldResetSweep: shouldResetSweep
     };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

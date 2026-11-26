@@ -424,7 +424,7 @@ function resetDecodePlan() {
     scanStats.sweepDone = true;
 }
 
-function sceneChanged() {
+function measureScene() {
     if (!sceneCanvas) {
         sceneCanvas = document.createElement('canvas');
         sceneCanvas.width = 32;
@@ -436,16 +436,23 @@ function sceneChanged() {
     const stamp = canvas.width + 'x' + canvas.height;
     if (!lastScene || lastScene.stamp !== stamp || lastScene.data.length !== data.length) {
         lastScene = { stamp: stamp, data: new Uint8ClampedArray(data) };
-        return true;
+        return { delta: Infinity, sizeChanged: true };
     }
     let changed = 0;
     for (let i = 0; i < data.length; i += 4) {
         if (Math.abs(data[i] - lastScene.data[i]) > 16) changed += 1;
     }
     lastScene.data.set(data);
-    // A few changed thumbnail pixels mean a new label. Averaging the whole
-    // thumbnail hid that, so a still screen never started the next sweep.
-    return changed >= 3;
+    return { delta: changed, sizeChanged: false };
+}
+
+function sceneShouldReset(measured, sweepOpen) {
+    return ScanlineDecoder.shouldResetSweep(
+        measured.delta,
+        measured.sizeChanged,
+        !!sweepOpen,
+        scanMode === 'screen'
+    );
 }
 
 function boostScaleFor(longSide) {
@@ -467,10 +474,12 @@ function buildDecodePasses() {
     }
     // Grayscale, contrast stretch, and a modest upscale once the plain
     // orientations have missed. Still one pass per frame.
+    // The scanline read is what recovers a blurry sideways label, so it runs
+    // before the slower contrast passes on a full-resolution screen frame.
+    passes.push({ kind: 'rescue' });
     passes.push({ kind: 'prep', quarters: 0 });
     passes.push({ kind: 'prep', quarters: 1 });
     passes.push({ kind: 'prep', quarters: 3 });
-    passes.push({ kind: 'rescue' });
     // Upscaling a blurry code thickens the blur until the bars merge.
     // When the painted frame was enlarged, also read the original crop.
     if (paintScale >= 1.5 && lastCrop) passes.push({ kind: 'soft' });
@@ -761,8 +770,11 @@ function rescueCodes() {
     let pixels = image.data;
     let width = image.width;
     let height = image.height;
+    // A screen frame is already the capture's own pixels. Shrinking it here
+    // undoes that and squeezes a label that only fills part of the monitor.
+    // Camera frames can still be reduced so a 4K preview does not stall.
     const longSide = Math.max(width, height);
-    if (longSide > 1100) {
+    if (scanMode !== 'screen' && longSide > 1100) {
         const scaled = ScanlineDecoder.scaleImage(pixels, width, height, 1100 / longSide);
         pixels = scaled.data;
         width = scaled.width;
@@ -789,7 +801,7 @@ function rememberCode(code) {
 }
 
 async function detectNative() {
-    const changed = sceneChanged();
+    const changed = sceneShouldReset(measureScene(), false);
     if (changed) {
         nativeHeld = new Map();
         nativeEmptyStreak = 0;
@@ -864,7 +876,8 @@ async function detectFromCanvas() {
     if (decoderKind === 'native') return detectNative();
 
     if (!canvas.width || !canvas.height) return [];
-    if (sceneChanged() || !decodePlan) {
+    const sweepOpen = !!(decodePlan && decodePlan.index < decodePlan.passes.length);
+    if (!decodePlan || sceneShouldReset(measureScene(), sweepOpen)) {
         boostScale = 1;
         decodePlan = { passes: buildDecodePasses(), index: 0, found: new Map(), extended: false };
     } else if (decodePlan.index >= decodePlan.passes.length) {
@@ -1310,19 +1323,11 @@ function drawVideoFrame() {
     }
 }
 
-// Integer upscales keep Code 128 bars aligned. A tight crop of a small
-// on-screen barcode is enlarged; a full desktop frame is capped so each
-// pass stays fast enough to repeat.
+// Never shrink a screen capture. The track's videoWidth and videoHeight are
+// the pixels to decode, for a 1D label and for a QR code. A small selected
+// region is the only thing that gets enlarged.
 function chooseScale(sourceWidth, sourceHeight, hasRegion) {
-    const longSide = Math.max(sourceWidth, sourceHeight);
-    const cap = hasRegion ? 1800 : 1200;
-    if (longSide <= 0) return 1;
-    if (longSide > cap) return cap / longSide;
-    // Small crops are enlarged so thin bars survive. A loose box still grows
-    // until the cap; the boost pass handles anything that is still too small.
-    if (longSide * 3 <= cap) return 3;
-    if (longSide * 2 <= cap) return 2;
-    return 1;
+    return ScanlineDecoder.screenScale(sourceWidth, sourceHeight, hasRegion);
 }
 
 function paintScreenCanvas() {
@@ -1330,27 +1335,17 @@ function paintScreenCanvas() {
     const vh = video.videoHeight;
     if (!vw || !vh) return false;
 
-    let sx = 0;
-    let sy = 0;
-    let sw = vw;
-    let sh = vh;
     const hasRegion = !!(screenRegion && !awaitingRegion);
-    if (hasRegion) {
-        sx = Math.round(screenRegion.x * vw);
-        sy = Math.round(screenRegion.y * vh);
-        sw = Math.round(screenRegion.w * vw);
-        sh = Math.round(screenRegion.h * vh);
-        // Pad a little so a tight box still leaves the barcode its quiet zone.
-        const padX = Math.round(sw * 0.08);
-        const padY = Math.round(sh * 0.1);
-        sx = Math.max(0, sx - padX);
-        sy = Math.max(0, sy - padY);
-        sw = Math.min(vw - sx, sw + padX * 2);
-        sh = Math.min(vh - sy, sh + padY * 2);
-    }
+    // Fractions come from the letterboxed preview, then map onto the capture.
+    // CSS pixels and devicePixelRatio are not applied again.
+    const source = ScanlineDecoder.screenSourceRect(vw, vh, hasRegion ? screenRegion : null);
+    const sx = source.sx;
+    const sy = source.sy;
+    const sw = source.sw;
+    const sh = source.sh;
     if (sw < 8 || sh < 8) return false;
 
-    const scale = chooseScale(sw, sh, hasRegion);
+    const scale = source.scale;
     paintScale = scale;
     lastCrop = { sx: sx, sy: sy, sw: sw, sh: sh };
     const dw = Math.max(1, Math.round(sw * scale));
