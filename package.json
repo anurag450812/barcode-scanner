@@ -1,10 +1,11 @@
 {
   "private": true,
   "scripts": {
-    "test": "node --test test/decode.test.mjs"
+    "test": "node --test test/decode.test.mjs test/screen-share.test.mjs"
   },
   "devDependencies": {
     "pngjs": "^7.0.0",
+    "puppeteer-core": "^24.43.1",
     "zxing-wasm": "3.1.7"
   }
 }

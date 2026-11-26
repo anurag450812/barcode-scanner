@@ -207,6 +207,117 @@ test('a different Code 128 is not reported as the Flipkart value', async () => {
     assert.equal(result.texts.includes(TARGET), false);
 });
 
+function downscale(src, sw, sh, scale) {
+    const dw = Math.max(1, Math.round(sw * scale));
+    const dh = Math.max(1, Math.round(sh * scale));
+    const out = new Uint8ClampedArray(dw * dh * 4);
+    for (let y = 0; y < dh; y++) {
+        const sy = Math.min(sh - 1, (y + 0.5) / scale - 0.5);
+        const y0 = Math.max(0, Math.floor(sy));
+        const y1 = Math.min(sh - 1, y0 + 1);
+        const fy = Math.min(1, Math.max(0, sy - y0));
+        for (let x = 0; x < dw; x++) {
+            const sx = Math.min(sw - 1, (x + 0.5) / scale - 0.5);
+            const x0 = Math.max(0, Math.floor(sx));
+            const x1 = Math.min(sw - 1, x0 + 1);
+            const fx = Math.min(1, Math.max(0, sx - x0));
+            const d = (y * dw + x) * 4;
+            for (let c = 0; c < 4; c++) {
+                out[d + c] =
+                    src[(y0 * sw + x0) * 4 + c] * (1 - fx) * (1 - fy) +
+                    src[(y0 * sw + x1) * 4 + c] * fx * (1 - fy) +
+                    src[(y1 * sw + x0) * 4 + c] * (1 - fx) * fy +
+                    src[(y1 * sw + x1) * 4 + c] * fx * fy;
+            }
+        }
+    }
+    return { data: out, width: dw, height: dh };
+}
+
+function placeOnScreen(photo) {
+    const width = 1920;
+    const height = 1080;
+    const data = new Uint8ClampedArray(width * height * 4);
+    for (let i = 0; i < data.length; i += 4) {
+        data[i] = data[i + 1] = data[i + 2] = 236;
+        data[i + 3] = 255;
+    }
+    const ox = 160;
+    const oy = 40;
+    for (let y = 0; y < photo.height; y++) {
+        for (let x = 0; x < photo.width; x++) {
+            const s = (y * photo.width + x) * 4;
+            const d = ((oy + y) * width + (ox + x)) * 4;
+            data[d] = photo.data[s];
+            data[d + 1] = photo.data[s + 1];
+            data[d + 2] = photo.data[s + 2];
+            data[d + 3] = 255;
+        }
+    }
+    return { data, width, height, ox, oy, photo };
+}
+
+test('screen capture stays full resolution and a small region maps to capture pixels', () => {
+    assert.equal(dec.screenScale(1920, 1080, false), 1);
+    assert.equal(dec.screenScale(1920, 1080, true), 1);
+    assert.equal(dec.screenScale(685, 310, true), 1);
+    assert.equal(dec.screenScale(400, 180, true), 2);
+    assert.equal(dec.screenScale(180, 120, true), 3);
+    assert.ok(dec.screenScale(800, 600, false) >= 1);
+    assert.ok(dec.screenScale(2560, 1440, true) >= 1);
+
+    const full = dec.screenSourceRect(1920, 1080, null);
+    assert.deepEqual([full.sx, full.sy, full.sw, full.sh, full.scale], [0, 0, 1920, 1080, 1]);
+
+    // A box drawn on a CSS preview is stored as fractions. Those fractions
+    // select the same capture pixels at 1x CSS size and at devicePixelRatio 2.
+    const region = { x: 160 / 1920, y: 40 / 1080, w: 310 / 1920, h: 685 / 1080 };
+    const crop = dec.screenSourceRect(1920, 1080, region);
+    assert.ok(crop.scale >= 1);
+    assert.ok(crop.sx <= 160 && crop.sy <= 40);
+    assert.ok(crop.sx + crop.sw >= 160 + 310);
+    assert.ok(crop.sy + crop.sh >= 40 + 685);
+    assert.ok(crop.sw <= 1920 && crop.sh <= 1080);
+
+    assert.equal(dec.shouldResetSweep(5, false, true, true), false);
+    assert.equal(dec.shouldResetSweep(5, false, false, false), true);
+    assert.equal(dec.shouldResetSweep(200, false, true, true), true);
+    assert.equal(dec.shouldResetSweep(0, true, true, true), true);
+});
+
+test('a small sideways label on a 1920x1080 frame decodes at native size', () => {
+    const photo = loadPng(new URL('./fixtures/flipkart-return.png', import.meta.url));
+    const frame = placeOnScreen(photo);
+    const hit = dec.readHardBarcode(frame.data, frame.width, frame.height);
+    assert.equal(hit && hit.text, TARGET);
+
+    const region = {
+        x: frame.ox / frame.width,
+        y: frame.oy / frame.height,
+        w: photo.width / frame.width,
+        h: photo.height / frame.height
+    };
+    const crop = dec.screenSourceRect(frame.width, frame.height, region);
+    assert.equal(crop.scale, 1);
+    const pixels = new Uint8ClampedArray(crop.sw * crop.sh * 4);
+    for (let y = 0; y < crop.sh; y++) {
+        for (let x = 0; x < crop.sw; x++) {
+            const s = ((crop.sy + y) * frame.width + (crop.sx + x)) * 4;
+            const d = (y * crop.sw + x) * 4;
+            pixels[d] = frame.data[s];
+            pixels[d + 1] = frame.data[s + 1];
+            pixels[d + 2] = frame.data[s + 2];
+            pixels[d + 3] = 255;
+        }
+    }
+    const cropped = dec.readHardBarcode(pixels, crop.sw, crop.sh);
+    assert.equal(cropped && cropped.text, TARGET);
+
+    const shrunk = downscale(frame.data, frame.width, frame.height, 1200 / 1920);
+    const missed = dec.readHardBarcode(shrunk.data, shrunk.width, shrunk.height);
+    assert.equal(missed, null);
+});
+
 test('noise does not decode', () => {
     const width = 240;
     const height = 90;
