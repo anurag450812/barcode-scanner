@@ -328,4 +328,108 @@ test('noise does not decode', () => {
         data[i + 3] = 255;
     }
     assert.equal(dec.readHardBarcode(data, width, height), null);
+    const skew = dec.estimateSkew(data, width, height);
+    const turned = dec.rotateDegrees(data, width, height, skew || 12);
+    assert.equal(dec.readHardBarcode(turned.data, turned.width, turned.height), null);
+});
+
+const TILTED = 'FMPR0998671372';
+const LOOKALIKE = 'FMPR0990671372';
+
+function readDeskewed(image) {
+    const skew = dec.estimateSkew(image.data, image.width, image.height);
+    const turned = dec.rotateDegrees(image.data, image.width, image.height, skew);
+    const hit = dec.readHardBarcode(turned.data, turned.width, turned.height);
+    return { skew, hit };
+}
+
+test('deskew rotates to the measured angle and does not shrink', () => {
+    const angles = dec.deskewAngles(12.2);
+    assert.equal(angles[0], 12.2);
+    assert.equal(angles.includes(12), false);
+    assert.equal(angles.includes(-12), true);
+    assert.equal(dec.deskewAngles(0).includes(0), false);
+    assert.equal(dec.deskewAngles(0)[0], 12);
+
+    const width = 80;
+    const height = 40;
+    const data = new Uint8ClampedArray(width * height * 4);
+    data.fill(255);
+    const turned = dec.rotateDegrees(data, width, height, 20);
+    assert.ok(Math.max(turned.width, turned.height) >= Math.max(width, height));
+    assert.equal(turned.data.length, turned.width * turned.height * 4);
+    const same = dec.rotateDegrees(data, width, height, 0);
+    assert.equal(same.width, width);
+    assert.equal(same.height, height);
+});
+
+test('tilted blurry Flipkart label decodes to FMPR0998671372', () => {
+    const photo = loadPng(new URL('./fixtures/flipkart-tilted.png', import.meta.url));
+    assert.equal(dec.readHardBarcode(photo.data, photo.width, photo.height), null);
+    const { skew, hit } = readDeskewed(photo);
+    console.log('tilted', hit && hit.text, 'skew', skew.toFixed(2), 'corr', hit && hit.corr);
+    assert.ok(Math.abs(skew) > 5);
+    assert.equal(hit && hit.text, TILTED);
+    assert.notEqual(hit && hit.text, LOOKALIKE);
+    for (const angle of dec.deskewAngles(skew)) {
+        const turned = dec.rotateDegrees(photo.data, photo.width, photo.height, angle);
+        const other = dec.readHardBarcode(turned.data, turned.width, turned.height);
+        if (other) assert.equal(other.text, TILTED, 'angle ' + angle + ' misread ' + other.text);
+    }
+});
+
+test('a deskew of the upright Flipkart label does not invent a different code', () => {
+    const photo = loadPng(new URL('./fixtures/flipkart-return.png', import.meta.url));
+    const { hit } = readDeskewed(photo);
+    assert.ok(!hit || hit.text === TARGET);
+});
+
+test('tilted label on a 1920x1080 frame decodes at native size, with and without a region', () => {
+    const photo = loadPng(new URL('./fixtures/flipkart-tilted.png', import.meta.url));
+    const frame = placeOnScreen(photo);
+    const full = readDeskewed(frame);
+    console.log('tilted frame', full.hit && full.hit.text, 'skew', full.skew.toFixed(2));
+    assert.equal(full.hit && full.hit.text, TILTED);
+
+    const region = {
+        x: frame.ox / frame.width,
+        y: frame.oy / frame.height,
+        w: photo.width / frame.width,
+        h: photo.height / frame.height
+    };
+    const crop = dec.screenSourceRect(frame.width, frame.height, region);
+    assert.equal(crop.scale, 1);
+    assert.ok(crop.sw >= photo.width && crop.sh >= photo.height);
+    const pixels = new Uint8ClampedArray(crop.sw * crop.sh * 4);
+    for (let y = 0; y < crop.sh; y++) {
+        for (let x = 0; x < crop.sw; x++) {
+            const s = ((crop.sy + y) * frame.width + (crop.sx + x)) * 4;
+            const d = (y * crop.sw + x) * 4;
+            pixels[d] = frame.data[s];
+            pixels[d + 1] = frame.data[s + 1];
+            pixels[d + 2] = frame.data[s + 2];
+            pixels[d + 3] = 255;
+        }
+    }
+    const cropped = readDeskewed({ data: pixels, width: crop.sw, height: crop.sh });
+    assert.equal(cropped.hit && cropped.hit.text, TILTED);
+});
+
+test('blurred Code 128 at arbitrary angles decodes after deskew', async () => {
+    const image = await code128(TILTED);
+    for (const angle of [17, 33, 72, -25, 110]) {
+        const rot = dec.rotateDegrees(image.data, image.width, image.height, angle);
+        const blurred = blurContrast(rot.data, rot.width, rot.height, 1.1, 0.5);
+        const { skew, hit } = readDeskewed(blurred);
+        console.log('angle', angle, 'skew', skew.toFixed(1), hit && hit.text);
+        assert.equal(hit && hit.text, TILTED, 'angle ' + angle);
+        assert.notEqual(hit && hit.text, LOOKALIKE);
+    }
+
+    const other = await code128('AWB9988776655');
+    const rot = dec.rotateDegrees(other.data, other.width, other.height, 23);
+    const blurred = blurContrast(rot.data, rot.width, rot.height, 1.1, 0.5);
+    const hit = readDeskewed(blurred).hit;
+    assert.equal(hit && hit.text, 'AWB9988776655');
+    assert.notEqual(hit && hit.text, TILTED);
 });

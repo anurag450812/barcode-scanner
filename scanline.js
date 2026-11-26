@@ -1,7 +1,9 @@
 // Reads a blurry or sideways Code 128 from a still frame when the normal
-// decoder does not. The scanline is the median of the sharpest stripe band,
-// checked in both directions. A read is kept only when the symbol checksum
-// pattern and the stop pattern sit where the data symbols say they should.
+// decoder does not. The scanline is the median of the sharpest stripe band
+// plus a few parallel lines through that band, checked in both directions.
+// A read is kept only when the symbol checksum pattern and the stop pattern
+// sit where the data symbols say they should. A label that is not square to
+// the frame is rotated to the dominant bar angle first.
 (function (root) {
     const PATTERNS = [
         [2, 1, 2, 2, 2, 3], [2, 2, 2, 1, 2, 3], [2, 2, 2, 2, 2, 2], [1, 2, 1, 2, 2, 3], [1, 2, 1, 3, 2, 2],
@@ -426,6 +428,66 @@
         return backward || forward;
     }
 
+    // A few rows (or columns) through the same band. Each one is averaged
+    // with its neighbours so a single noisy row does not cast a vote.
+    function parallelLines(gray, width, height, alongY, band) {
+        const length = alongY ? height : width;
+        const cross = alongY ? width : height;
+        const lines = [];
+        const mid = (band.start + band.end - 1) / 2;
+        const spread = Math.max(4, Math.min(16, (band.end - band.start) / 2));
+        const fracs = [-0.75, 0, 0.75];
+        for (let f = 0; f < fracs.length; f++) {
+            const pos = Math.round(mid + fracs[f] * spread);
+            if (pos < 1 || pos >= cross - 1) continue;
+            const line = new Float32Array(length);
+            for (let i = 0; i < length; i++) {
+                if (alongY) {
+                    const row = i * width;
+                    line[i] = (gray[row + pos - 1] + gray[row + pos] * 2 + gray[row + pos + 1]) * 0.25;
+                } else {
+                    line[i] = (gray[(pos - 1) * width + i] + gray[pos * width + i] * 2 + gray[(pos + 1) * width + i]) * 0.25;
+                }
+            }
+            lines.push(line);
+        }
+        return lines;
+    }
+
+    // Agreeing lines keep the stronger correlation. Two different texts that
+    // both confirm, and sit close in correlation, are a misread: drop both.
+    function voteCandidates(candidates) {
+        if (!candidates.length) return null;
+        const groups = [];
+        for (let i = 0; i < candidates.length; i++) {
+            const hit = candidates[i];
+            let group = null;
+            for (let g = 0; g < groups.length; g++) {
+                if (groups[g].text === hit.text) {
+                    group = groups[g];
+                    break;
+                }
+            }
+            if (!group) {
+                group = { text: hit.text, corr: hit.corr, votes: 0 };
+                groups.push(group);
+            }
+            group.votes += 1;
+            if (hit.corr > group.corr) group.corr = hit.corr;
+        }
+        groups.sort(function (a, b) {
+            if (b.votes !== a.votes) return b.votes - a.votes;
+            return b.corr - a.corr;
+        });
+        const top = groups[0];
+        for (let i = 1; i < groups.length; i++) {
+            const other = groups[i];
+            if (other.votes === top.votes && other.corr > top.corr - 0.06) return null;
+            if (top.votes === 1 && other.corr > top.corr - 0.06) return null;
+        }
+        return { text: top.text, format: 'Code128', corr: top.corr };
+    }
+
     function readHardBarcode(data, width, height) {
         if (!data || width < 24 || height < 24) return null;
         const gray = luminance(data, width, height);
@@ -439,18 +501,14 @@
                 const line = medianLine(gray, width, height, alongY, bands[b]);
                 const hit = readLine(line);
                 if (hit) candidates.push(hit);
+                const lines = parallelLines(gray, width, height, alongY, bands[b]);
+                for (let p = 0; p < lines.length; p++) {
+                    const one = readLine(lines[p]);
+                    if (one) candidates.push(one);
+                }
             }
         }
-        if (!candidates.length) return null;
-        candidates.sort(function (a, b) {
-            if (Math.abs(b.corr - a.corr) > 0.03) return b.corr - a.corr;
-            return b.text.length - a.text.length;
-        });
-        const top = candidates[0];
-        for (let i = 1; i < candidates.length; i++) {
-            if (candidates[i].text !== top.text && candidates[i].corr > top.corr - 0.06) return null;
-        }
-        return { text: top.text, format: 'Code128', corr: top.corr };
+        return voteCandidates(candidates);
     }
 
     // One turn is 90 degrees clockwise. Quarters 1, 2 and 3 are 90, 180 and 270.
@@ -623,6 +681,101 @@
         return delta >= 40;
     }
 
+    // Clockwise degrees that put the dominant edges on the nearest axis.
+    // The structure tensor is taken over strong gradients only, subsampled
+    // so a 1080p frame stays cheap. A flat frame returns 0.
+    function estimateSkew(data, width, height) {
+        if (!data || width < 16 || height < 16) return 0;
+        let gxx = 0;
+        let gyy = 0;
+        let gxy = 0;
+        let n = 0;
+        const step = Math.max(1, Math.floor(Math.max(width, height) / 400));
+        function lum(x, y) {
+            const i = (y * width + x) * 4;
+            return data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+        }
+        for (let y = 1; y < height - 1; y += step) {
+            for (let x = 1; x < width - 1; x += step) {
+                const gx = lum(x + 1, y) - lum(x - 1, y);
+                const gy = lum(x, y + 1) - lum(x, y - 1);
+                const mag = gx * gx + gy * gy;
+                if (mag < 400) continue;
+                gxx += gx * gx;
+                gyy += gy * gy;
+                gxy += gx * gy;
+                n += 1;
+            }
+        }
+        if (n < 40) return 0;
+        const phi = 0.5 * Math.atan2(2 * gxy, gxx - gyy) * 180 / Math.PI;
+        let fold = ((phi % 90) + 90) % 90;
+        if (fold > 45) fold -= 90;
+        return -fold;
+    }
+
+    // Clockwise rotation about the centre. The output box grows to fit the
+    // source; the source itself is never scaled down. A near-zero angle
+    // returns the original pixels.
+    function rotateDegrees(data, width, height, degrees) {
+        const deg = degrees || 0;
+        if (!data || width < 1 || height < 1 || Math.abs(deg) < 0.4) {
+            return { data: data, width: width, height: height };
+        }
+        const rad = deg * Math.PI / 180;
+        const cos = Math.cos(rad);
+        const sin = Math.sin(rad);
+        const dw = Math.max(1, Math.ceil(Math.abs(width * cos) + Math.abs(height * sin)));
+        const dh = Math.max(1, Math.ceil(Math.abs(width * sin) + Math.abs(height * cos)));
+        const out = new Uint8ClampedArray(dw * dh * 4);
+        out.fill(255);
+        const cx = width / 2;
+        const cy = height / 2;
+        const ocx = dw / 2;
+        const ocy = dh / 2;
+        for (let y = 0; y < dh; y++) {
+            for (let x = 0; x < dw; x++) {
+                const dx = x - ocx;
+                const dy = y - ocy;
+                const sx = dx * cos + dy * sin + cx;
+                const sy = -dx * sin + dy * cos + cy;
+                if (sx < 0 || sy < 0 || sx >= width - 1 || sy >= height - 1) continue;
+                const x0 = sx | 0;
+                const y0 = sy | 0;
+                const fx = sx - x0;
+                const fy = sy - y0;
+                const dp = (y * dw + x) * 4;
+                const i00 = (y0 * width + x0) * 4;
+                const i10 = i00 + 4;
+                const i01 = i00 + width * 4;
+                const i11 = i01 + 4;
+                for (let k = 0; k < 3; k++) {
+                    out[dp + k] =
+                        data[i00 + k] * (1 - fx) * (1 - fy) +
+                        data[i10 + k] * fx * (1 - fy) +
+                        data[i01 + k] * (1 - fx) * fy +
+                        data[i11 + k] * fx * fy;
+                }
+                out[dp + 3] = 255;
+            }
+        }
+        return { data: out, width: dw, height: dh };
+    }
+
+    // The measured angle first, then a 12 degree grid it did not already
+    // cover. Callers try one angle per frame. An angle near 0 is left out
+    // because the axis-aligned scanline already ran.
+    function deskewAngles(skew) {
+        const base = isFinite(skew) ? skew : 0;
+        const angles = [];
+        if (Math.abs(base) >= 0.4) angles.push(base);
+        const grid = [12, -12, 24, -24, 36, -36];
+        for (let i = 0; i < grid.length; i++) {
+            if (Math.abs(grid[i] - base) > 5) angles.push(grid[i]);
+        }
+        return angles;
+    }
+
     root.ScanlineDecoder = {
         ZXING_FORMATS: ZXING_FORMATS,
         ZXING_HARD_FORMATS: ZXING_HARD_FORMATS,
@@ -639,6 +792,9 @@
         unrotatePoint: unrotatePoint,
         screenScale: screenScale,
         screenSourceRect: screenSourceRect,
-        shouldResetSweep: shouldResetSweep
+        shouldResetSweep: shouldResetSweep,
+        estimateSkew: estimateSkew,
+        rotateDegrees: rotateDegrees,
+        deskewAngles: deskewAngles
     };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

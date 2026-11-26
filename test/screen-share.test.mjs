@@ -10,6 +10,7 @@ import puppeteer from 'puppeteer-core';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const TARGET = 'FMPR1001860327';
+const TILTED = 'FMPR0998671372';
 const TYPES = {
     '.html': 'text/html',
     '.js': 'text/javascript',
@@ -42,10 +43,10 @@ function startServer() {
     });
 }
 
-async function scanScreen(page, mode) {
-    await page.evaluate(async (which) => {
+async function scanScreen(page, mode, fixture, target) {
+    await page.evaluate(async (which, file) => {
         const img = new Image();
-        img.src = '/test/fixtures/flipkart-return.png';
+        img.src = file;
         await img.decode();
         const board = document.createElement('canvas');
         board.width = 1920;
@@ -64,8 +65,8 @@ async function scanScreen(page, mode) {
             w: img.naturalWidth / board.width,
             h: img.naturalHeight / board.height
         };
-        document.getElementById(which === 'region' ? 'screenBtn' : 'screenBtn').click();
-    }, mode);
+        document.getElementById('screenBtn').click();
+    }, mode, fixture);
 
     await page.waitForFunction(() => {
         const video = document.getElementById('video');
@@ -112,10 +113,10 @@ async function scanScreen(page, mode) {
     await page.waitForFunction(target => {
         const values = Array.from(document.querySelectorAll('.code-value')).map(node => node.textContent);
         return values.indexOf(target) !== -1;
-    }, { timeout: 45000 }, TARGET);
+    }, { timeout: 45000 }, target);
 
     const values = await page.$$eval('.code-value', nodes => nodes.map(node => node.textContent));
-    assert.deepEqual(values, [TARGET]);
+    assert.deepEqual(values, [target]);
     const size = await page.evaluate(() => {
         const video = document.getElementById('video');
         return { videoWidth: video.videoWidth, videoHeight: video.videoHeight };
@@ -123,7 +124,7 @@ async function scanScreen(page, mode) {
     assert.deepEqual(size, { videoWidth: 1920, videoHeight: 1080 });
 }
 
-test('Scan Screen reads a small sideways label from a fake display stream', async () => {
+test('Scan Screen reads a sideways label and a tilted label from a fake display stream', async () => {
     const server = await startServer();
     const port = server.address().port;
     const browser = await puppeteer.launch({
@@ -137,17 +138,23 @@ test('Scan Screen reads a small sideways label from a fake display stream', asyn
         ]
     });
     try {
-        for (const mode of ['full', 'region']) {
+        const cases = [
+            { mode: 'full', file: '/test/fixtures/flipkart-return.png', target: TARGET },
+            { mode: 'region', file: '/test/fixtures/flipkart-return.png', target: TARGET },
+            { mode: 'full', file: '/test/fixtures/flipkart-tilted.png', target: TILTED },
+            { mode: 'region', file: '/test/fixtures/flipkart-tilted.png', target: TILTED }
+        ];
+        for (const item of cases) {
             const page = await browser.newPage();
             page.setDefaultTimeout(20000);
             await page.setViewport({ width: 1280, height: 800, deviceScaleFactor: 2 });
-            page.on('pageerror', err => console.log('pageerror', mode, err.message));
+            page.on('pageerror', err => console.log('pageerror', item.mode, item.target, err.message));
             page.on('console', msg => {
-                if (msg.type() === 'error') console.log('console', mode, msg.text());
+                if (msg.type() === 'error') console.log('console', item.mode, item.target, msg.text());
             });
             await page.goto('http://127.0.0.1:' + port + '/', { waitUntil: 'domcontentloaded' });
-            await scanScreen(page, mode);
-            console.log('screen', mode, 'decoded', TARGET, 'at devicePixelRatio 2');
+            await scanScreen(page, item.mode, item.file, item.target);
+            console.log('screen', item.mode, 'decoded', item.target, 'at devicePixelRatio 2');
             await page.close();
         }
     } finally {

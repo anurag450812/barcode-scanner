@@ -88,6 +88,7 @@ let nativeQuarterCursor = 0;
 let nativeHeld = new Map();
 let nativeEmptyStreak = 0;
 let nativeRescued = false;
+let nativeDeskewAngles = null;
 
 function resumeAudio() {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -416,6 +417,7 @@ function resetDecodePlan() {
     nativeHeld = new Map();
     nativeEmptyStreak = 0;
     nativeRescued = false;
+    nativeDeskewAngles = null;
     scanStats.decodes = 0;
     scanStats.decodeMs = 0;
     scanStats.skips = 0;
@@ -476,7 +478,18 @@ function buildDecodePasses() {
     // orientations have missed. Still one pass per frame.
     // The scanline read is what recovers a blurry sideways label, so it runs
     // before the slower contrast passes on a full-resolution screen frame.
+    // A label that is tilted off the axis is rotated to the measured bar
+    // angle first, then to a 12 degree grid, one angle per frame.
     passes.push({ kind: 'rescue' });
+    let skew = 0;
+    if (canvas && context && canvas.width > 0 && canvas.height > 0) {
+        const image = context.getImageData(0, 0, canvas.width, canvas.height);
+        skew = ScanlineDecoder.estimateSkew(image.data, image.width, image.height);
+    }
+    const angles = ScanlineDecoder.deskewAngles(skew);
+    for (let i = 0; i < angles.length; i++) {
+        passes.push({ kind: 'deskew', angle: angles[i], primary: i === 0 });
+    }
     passes.push({ kind: 'prep', quarters: 0 });
     passes.push({ kind: 'prep', quarters: 1 });
     passes.push({ kind: 'prep', quarters: 3 });
@@ -790,6 +803,44 @@ function rescueCodes() {
     return [{ value: hit.text, format: hit.format || 'Code128', rect: null }];
 }
 
+// Full-resolution pixels, rotated clockwise by `angle`. A screen capture is
+// not reduced. Camera frames follow the same rule as the axis-aligned rescue.
+function deskewFrame(angle) {
+    if (!window.ScanlineDecoder || !canvas.width || !canvas.height) return null;
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    let pixels = image.data;
+    let width = image.width;
+    let height = image.height;
+    const longSide = Math.max(width, height);
+    if (scanMode !== 'screen' && longSide > 1100) {
+        const scaled = ScanlineDecoder.scaleImage(pixels, width, height, 1100 / longSide);
+        pixels = scaled.data;
+        width = scaled.width;
+        height = scaled.height;
+    }
+    const turned = ScanlineDecoder.rotateDegrees(pixels, width, height, angle);
+    return {
+        pixels: turned.data,
+        width: turned.width,
+        height: turned.height,
+        srcW: width,
+        srcH: height,
+        angle: angle
+    };
+}
+
+function deskewScanline(frame) {
+    if (!frame) return [];
+    const started = performance.now();
+    const hit = ScanlineDecoder.readHardBarcode(frame.pixels, frame.width, frame.height);
+    const elapsed = performance.now() - started;
+    scanStats.decodes += 1;
+    scanStats.decodeMs += elapsed;
+    scanStats.lastMs = elapsed;
+    if (!hit || !hit.text) return [];
+    return [{ value: hit.text, format: hit.format || 'Code128', rect: null }];
+}
+
 function rememberCode(code) {
     const value = String(code.value || '').trim();
     if (!value || !decodePlan) return;
@@ -806,6 +857,7 @@ async function detectNative() {
         nativeHeld = new Map();
         nativeEmptyStreak = 0;
         nativeRescued = false;
+        nativeDeskewAngles = null;
     }
     const quarters = ScanlineDecoder.LIVE_QUARTERS;
     const quarter = quarters[nativeQuarterCursor % quarters.length];
@@ -826,10 +878,25 @@ async function detectNative() {
         if (!nativeHeld.size) {
             nativeEmptyStreak += 1;
             // One scanline rescue per still scene, after each orientation has
-            // had a frame. A moving camera stays on the rotate-and-retry path.
-            if (!changed && !nativeRescued && nativeEmptyStreak >= quarters.length) {
-                nativeRescued = true;
-                rescueCodes().forEach(code => nativeHeld.set(code.value, code));
+            // had a frame, then one deskew angle per frame. A moving camera
+            // stays on the rotate-and-retry path.
+            if (!changed && nativeEmptyStreak >= quarters.length) {
+                const step = nativeEmptyStreak - quarters.length;
+                if (step === 0 && !nativeRescued) {
+                    nativeRescued = true;
+                    rescueCodes().forEach(code => nativeHeld.set(code.value, code));
+                } else if (step >= 1 && !nativeHeld.size) {
+                    if (!nativeDeskewAngles) {
+                        const image = context.getImageData(0, 0, canvas.width, canvas.height);
+                        nativeDeskewAngles = ScanlineDecoder.deskewAngles(
+                            ScanlineDecoder.estimateSkew(image.data, image.width, image.height)
+                        );
+                    }
+                    const angle = nativeDeskewAngles[step - 1];
+                    if (angle !== undefined) {
+                        deskewScanline(deskewFrame(angle)).forEach(code => nativeHeld.set(code.value, code));
+                    }
+                }
             }
         }
         return Array.from(nativeHeld.values());
@@ -897,8 +964,39 @@ async function detectFromCanvas() {
     decodePlan.index += 1;
     scanStats.lastPass = pass.kind
         + (pass.quarters ? ':' + (pass.quarters * 90) : '')
-        + (pass.angle ? ':' + pass.angle : '');
+        + (typeof pass.angle === 'number' ? ':' + pass.angle : '');
     scanStats.sweepDone = decodePlan.index >= decodePlan.passes.length;
+    if (pass.kind === 'deskew') {
+        // Later angles are a backup for a bad estimate. Once any code is in
+        // hand the exact-angle pass has already run, so the grid can wait.
+        const skip = decodePlan.found.size > 0 && !pass.primary;
+        if (!skip) {
+            const frame = deskewFrame(pass.angle);
+            deskewScanline(frame).forEach(rememberCode);
+            if (decodePlan.found.size === 0 && pass.primary && frame) {
+                paintRGBA(frame.pixels, frame.width, frame.height);
+                try {
+                    const codes = await readPrepared({
+                        canvas: passCanvas,
+                        context: passContext,
+                        options: ZXING_HARD_OPTIONS,
+                        transform: {
+                            angle: pass.angle,
+                            scale: 1,
+                            srcW: frame.srcW,
+                            srcH: frame.srcH,
+                            dstW: frame.width,
+                            dstH: frame.height
+                        }
+                    });
+                    codes.forEach(rememberCode);
+                } catch (err) {
+                    console.error('Barcode decode failed:', err);
+                }
+            }
+        }
+        return foundCodes();
+    }
     const prepared = preparePass(pass);
     if (!prepared) return foundCodes();
     if (prepared.rescue) {
